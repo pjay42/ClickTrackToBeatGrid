@@ -1,63 +1,58 @@
 const audioCtx = new AudioContext();
+
 const fileInput = document.getElementById("fileInput");
 const analyzeBtn = document.getElementById("processBtn");
 const canvas = document.getElementById("waveform");
 const ctx = canvas.getContext("2d");
 const output = document.getElementById("output");
 
+/* =======================
+   MAIN CLICK HANDLER
+======================= */
 analyzeBtn.addEventListener("click", async () => {
-  try {
-    if (!fileInput.files.length) return;
+  if (!fileInput.files.length) return;
 
-    await audioCtx.resume();
+  await audioCtx.resume();
 
-    const file = fileInput.files[0];
-    const buffer = await decode(file);
-    const samples = buffer.getChannelData(0);
-    const sr = buffer.sampleRate;
+  const file = fileInput.files[0];
+  const buffer = await decode(file);
 
-    resizeCanvas();
-    drawWaveform(samples);
+  const samples = buffer.getChannelData(0);
+  const sr = buffer.sampleRate;
 
-    const clicks = detectClicks(samples, sr);
-    if (!clicks.length) {
-      output.textContent = "No clicks detected.";
-      return;
-    }
+  resizeCanvas();
+  drawWaveform(samples);
 
-    const analyzed = clicks.map(time => ({
-      time,
-      freq: analyzeFFT(samples, sr, time)
-    }));
+  const clicks = detectClicks(samples, sr);
 
-    const { downbeats, beats } = classify(analyzed);
-    const tempoChanges = detectTempo(clicks);
+  const events = clicks.map(time => ({
+    time,
+    centroid: spectralCentroid(samples, sr, time)
+  }));
 
-    output.textContent = JSON.stringify(
-      { downbeats, beats, tempoChanges },
-      null,
-      2
-    );
+  const { downbeats, beats } = classify(events);
+  const tempoChanges = detectTempo(clicks);
 
-  } catch (err) {
-    console.error(err);
-    output.textContent = "Error: " + err.message;
-  }
+  output.textContent = JSON.stringify(
+    { downbeats, beats, tempoChanges },
+    null,
+    2
+  );
 });
 
-/* ---------------- AUDIO ---------------- */
-
+/* =======================
+   AUDIO DECODE
+======================= */
 async function decode(file) {
   const data = await file.arrayBuffer();
-  return audioCtx.decodeAudioData(data);
+  return await audioCtx.decodeAudioData(data);
 }
 
-/* ---------------- CLICK DETECTION ---------------- */
-
+/* =======================
+   CLICK DETECTION
+======================= */
 function detectClicks(samples, sr) {
   let max = 0;
-
-  // FAST peak scan (no allocations)
   for (let i = 0; i < samples.length; i++) {
     const v = Math.abs(samples[i]);
     if (v > max) max = v;
@@ -78,23 +73,22 @@ function detectClicks(samples, sr) {
       last = t;
     }
   }
-
   return clicks;
 }
 
-/* ---------------- FFT / SPECTRAL CENTROID ---------------- */
-
-function analyzeFFT(samples, sr, time) {
+/* =======================
+   SPECTRAL CENTROID (NO WEB AUDIO)
+======================= */
+function spectralCentroid(samples, sr, time) {
   const size = 2048;
   const start = Math.floor(time * sr);
 
   if (start + size >= samples.length) return 0;
 
-  // Windowed slice
   let weightedSum = 0;
   let magSum = 0;
 
-  for (let i = 0; i < size / 2; i++) {
+  for (let i = 0; i < size; i++) {
     const sample = samples[start + i];
     const mag = Math.abs(sample);
     const freq = (i * sr) / size;
@@ -106,41 +100,46 @@ function analyzeFFT(samples, sr, time) {
   return magSum ? weightedSum / magSum : 0;
 }
 
-/* ---------------- CLASSIFICATION ---------------- */
-
+/* =======================
+   CLASSIFICATION
+======================= */
 function classify(events) {
-  const freqs = events.map(e => e.freq).sort((a, b) => a - b);
-  const split = freqs[Math.floor(freqs.length / 2)];
+  const values = events.map(e => e.centroid).sort((a, b) => a - b);
+  const mid = values[Math.floor(values.length / 2)];
 
   const low = [];
   const high = [];
 
-  events.forEach(e => (e.freq < split ? low : high).push(e));
+  events.forEach(e =>
+    (e.centroid < mid ? low : high).push(e)
+  );
 
   return low.length < high.length
     ? { downbeats: low, beats: high }
     : { downbeats: high, beats: low };
 }
 
-/* ---------------- TEMPO ---------------- */
-
+/* =======================
+   TEMPO DETECTION
+======================= */
 function detectTempo(times, tolerance = 1) {
   let last = null;
   const changes = [];
 
   for (let i = 1; i < times.length; i++) {
     const bpm = 60 / (times[i] - times[i - 1]);
+
     if (!last || Math.abs(bpm - last) > tolerance) {
-      changes.push({ time: times[i], bpm: Math.round(bpm * 100) / 100 });
+      changes.push({ time: times[i], bpm });
       last = bpm;
     }
   }
-
   return changes;
 }
 
-/* ---------------- VISUALS ---------------- */
-
+/* =======================
+   CANVAS
+======================= */
 function resizeCanvas() {
   canvas.width = canvas.clientWidth;
   canvas.height = canvas.clientHeight;
@@ -159,6 +158,5 @@ function drawWaveform(samples) {
     const y = mid + s * mid;
     x === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
   }
-
   ctx.stroke();
 }
