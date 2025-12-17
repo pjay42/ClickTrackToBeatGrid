@@ -43,8 +43,11 @@ async function decode(file) {
 }
 
 function detectClicks(samples, sr) {
-  const threshold = 0.4;
-  const minGap = 0.05;
+  const abs = samples.map(v => Math.abs(v));
+  const max = Math.max(...abs);
+  const threshold = max * 0.35; // adaptive
+
+  const minGap = 0.08;
   const clicks = [];
   let last = -Infinity;
 
@@ -60,18 +63,21 @@ function detectClicks(samples, sr) {
   return clicks;
 }
 
-async function analyzeFFT(samples, sr, time) {
-  const length = 2048;
-  const start = Math.floor(time * sr);
-  const slice = samples.slice(start, start + length);
 
-  const offline = new OfflineAudioContext(1, length, sr);
-  const buffer = offline.createBuffer(1, slice.length, sr);
-  buffer.copyToChannel(slice, 0);
+async function analyzeFFT(samples, sr, time) {
+  const size = 2048;
+  const start = Math.floor(time * sr);
+
+  if (start + size >= samples.length) return 0;
+
+  const offline = new OfflineAudioContext(1, size, sr);
+  const buffer = offline.createBuffer(1, size, sr);
+
+  buffer.copyToChannel(samples.slice(start, start + size), 0);
 
   const src = offline.createBufferSource();
   const analyser = offline.createAnalyser();
-  analyser.fftSize = length;
+  analyser.fftSize = size;
 
   src.buffer = buffer;
   src.connect(analyser);
@@ -93,7 +99,22 @@ async function analyzeFFT(samples, sr, time) {
     }
   }
 
-  return index * (sr / length);
+  return index * sr / size;
+}
+
+function spectralCentroid(freqData, sampleRate, fftSize) {
+  let weightedSum = 0;
+  let magnitudeSum = 0;
+
+  for (let i = 0; i < freqData.length; i++) {
+    const mag = Math.pow(10, freqData[i] / 20); // dB → linear
+    const freq = i * sampleRate / fftSize;
+
+    weightedSum += freq * mag;
+    magnitudeSum += mag;
+  }
+
+  return magnitudeSum ? weightedSum / magnitudeSum : 0;
 }
 
 function classify(events) {
