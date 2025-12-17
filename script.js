@@ -6,48 +6,66 @@ const ctx = canvas.getContext("2d");
 const output = document.getElementById("output");
 
 analyzeBtn.addEventListener("click", async () => {
-  if (!fileInput.files.length) return;
+  try {
+    if (!fileInput.files.length) return;
 
-  // REQUIRED for Chrome / Safari
-  await audioCtx.resume();
+    await audioCtx.resume();
 
-  const file = fileInput.files[0];
-  const buffer = await decode(file);
-  const samples = buffer.getChannelData(0);
-  const sr = buffer.sampleRate;
+    const file = fileInput.files[0];
+    const buffer = await decode(file);
+    const samples = buffer.getChannelData(0);
+    const sr = buffer.sampleRate;
 
-  resizeCanvas();
-  drawWaveform(samples);
+    resizeCanvas();
+    drawWaveform(samples);
 
-  const clicks = detectClicks(samples, sr);
+    const clicks = detectClicks(samples, sr);
+    if (!clicks.length) {
+      output.textContent = "No clicks detected.";
+      return;
+    }
 
-  const analyzed = [];
-  for (const time of clicks) {
-    const freq = await analyzeFFT(samples, sr, time);
-    analyzed.push({ time, freq });
+    const analyzed = clicks.map(time => ({
+      time,
+      freq: analyzeFFT(samples, sr, time)
+    }));
+
+    const { downbeats, beats } = classify(analyzed);
+    const tempoChanges = detectTempo(clicks);
+
+    output.textContent = JSON.stringify(
+      { downbeats, beats, tempoChanges },
+      null,
+      2
+    );
+
+  } catch (err) {
+    console.error(err);
+    output.textContent = "Error: " + err.message;
   }
-
-  const { downbeats, beats } = classify(analyzed);
-  const tempoChanges = detectTempo(clicks);
-
-  output.textContent = JSON.stringify(
-    { downbeats, beats, tempoChanges },
-    null,
-    2
-  );
 });
+
+/* ---------------- AUDIO ---------------- */
 
 async function decode(file) {
   const data = await file.arrayBuffer();
   return audioCtx.decodeAudioData(data);
 }
 
-function detectClicks(samples, sr) {
-  const abs = samples.map(v => Math.abs(v));
-  const max = Math.max(...abs);
-  const threshold = max * 0.35; // adaptive
+/* ---------------- CLICK DETECTION ---------------- */
 
+function detectClicks(samples, sr) {
+  let max = 0;
+
+  // FAST peak scan (no allocations)
+  for (let i = 0; i < samples.length; i++) {
+    const v = Math.abs(samples[i]);
+    if (v > max) max = v;
+  }
+
+  const threshold = max * 0.35;
   const minGap = 0.08;
+
   const clicks = [];
   let last = -Infinity;
 
@@ -60,56 +78,38 @@ function detectClicks(samples, sr) {
       last = t;
     }
   }
+
   return clicks;
 }
 
-async function analyzeFFT(samples, sr, time) {
+/* ---------------- FFT / SPECTRAL CENTROID ---------------- */
+
+function analyzeFFT(samples, sr, time) {
   const size = 2048;
   const start = Math.floor(time * sr);
 
   if (start + size >= samples.length) return 0;
 
-  const offline = new OfflineAudioContext(1, size, sr);
-  const buffer = offline.createBuffer(1, size, sr);
-
-  buffer.copyToChannel(samples.slice(start, start + size), 0);
-
-  const src = offline.createBufferSource();
-  const analyser = offline.createAnalyser();
-  analyser.fftSize = size;
-
-  src.buffer = buffer;
-  src.connect(analyser);
-  analyser.connect(offline.destination);
-  src.start();
-
-  await offline.startRendering();
-
-  const freqData = new Float32Array(analyser.frequencyBinCount);
-  analyser.getFloatFrequencyData(freqData);
-
-  // 🔥 THIS is the important line
-  return spectralCentroid(freqData, sr, size);
-}
-
-
-function spectralCentroid(freqData, sampleRate, fftSize) {
+  // Windowed slice
   let weightedSum = 0;
-  let magnitudeSum = 0;
+  let magSum = 0;
 
-  for (let i = 0; i < freqData.length; i++) {
-    const mag = Math.pow(10, freqData[i] / 20); // dB → linear
-    const freq = i * sampleRate / fftSize;
+  for (let i = 0; i < size / 2; i++) {
+    const sample = samples[start + i];
+    const mag = Math.abs(sample);
+    const freq = (i * sr) / size;
 
     weightedSum += freq * mag;
-    magnitudeSum += mag;
+    magSum += mag;
   }
 
-  return magnitudeSum ? weightedSum / magnitudeSum : 0;
+  return magSum ? weightedSum / magSum : 0;
 }
 
+/* ---------------- CLASSIFICATION ---------------- */
+
 function classify(events) {
-  const freqs = events.map(e => e.freq).sort((a,b)=>a-b);
+  const freqs = events.map(e => e.freq).sort((a, b) => a - b);
   const split = freqs[Math.floor(freqs.length / 2)];
 
   const low = [];
@@ -122,6 +122,8 @@ function classify(events) {
     : { downbeats: high, beats: low };
 }
 
+/* ---------------- TEMPO ---------------- */
+
 function detectTempo(times, tolerance = 1) {
   let last = null;
   const changes = [];
@@ -129,12 +131,15 @@ function detectTempo(times, tolerance = 1) {
   for (let i = 1; i < times.length; i++) {
     const bpm = 60 / (times[i] - times[i - 1]);
     if (!last || Math.abs(bpm - last) > tolerance) {
-      changes.push({ time: times[i], bpm });
+      changes.push({ time: times[i], bpm: Math.round(bpm * 100) / 100 });
       last = bpm;
     }
   }
+
   return changes;
 }
+
+/* ---------------- VISUALS ---------------- */
 
 function resizeCanvas() {
   canvas.width = canvas.clientWidth;
@@ -154,5 +159,6 @@ function drawWaveform(samples) {
     const y = mid + s * mid;
     x === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
   }
+
   ctx.stroke();
 }
