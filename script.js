@@ -1,6 +1,6 @@
 const audioCtx = new AudioContext();
 const fileInput = document.getElementById("fileInput");
-const analyzeBtn = document.getElementById("analyze");
+const analyzeBtn = document.getElementById("processBtn");
 const canvas = document.getElementById("waveform");
 const ctx = canvas.getContext("2d");
 const output = document.getElementById("output");
