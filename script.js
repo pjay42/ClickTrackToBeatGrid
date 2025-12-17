@@ -63,7 +63,6 @@ function detectClicks(samples, sr) {
   return clicks;
 }
 
-
 async function analyzeFFT(samples, sr, time) {
   const size = 2048;
   const start = Math.floor(time * sr);
@@ -86,21 +85,13 @@ async function analyzeFFT(samples, sr, time) {
 
   await offline.startRendering();
 
-  const data = new Float32Array(analyser.frequencyBinCount);
-  analyser.getFloatFrequencyData(data);
+  const freqData = new Float32Array(analyser.frequencyBinCount);
+  analyser.getFloatFrequencyData(freqData);
 
-  let max = -Infinity;
-  let index = 0;
-
-  for (let i = 0; i < data.length; i++) {
-    if (data[i] > max) {
-      max = data[i];
-      index = i;
-    }
-  }
-
-  return index * sr / size;
+  // 🔥 THIS is the important line
+  return spectralCentroid(freqData, sr, size);
 }
+
 
 function spectralCentroid(freqData, sampleRate, fftSize) {
   let weightedSum = 0;
