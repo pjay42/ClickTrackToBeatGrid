@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Click Track to MA3 XML</title>
+<style>
+body {
+font-family: system-ui, sans-serif;
+background: #0f172a;
+color: #e2e8f0;
+padding: 20px;
+}
+canvas {
+width: 100%;
+height: 200px;
+background: #020617;
+border-radius: 8px;
+margin-bottom: 16px;
+}
+button {
+padding: 8px 16px;
+background: #3b82f6;
+border: none;
+border-radius: 6px;
+color: white;
+cursor: pointer;
+}
+</style>
+</head>
+<body>
+<h1>Click Track → grandMA3 Beat Grid</h1>
+
+<input type="file" id="fileInput" accept="audio/wav,audio/mp3" />
+<button id="processBtn">Analyze</button>
+
+<canvas id="waveform"></canvas>
+
+<pre id="output"></pre>
+
+<script src="script.js"></script>
+</body>
+</html>
