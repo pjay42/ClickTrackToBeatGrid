@@ -1,15 +1,20 @@
+// =========================
+// DOM & AUDIO SETUP
+// =========================
 const audioCtx = new AudioContext();
 
 const fileInput = document.getElementById("fileInput");
-const analyzeBtn = document.getElementById("analyzeBtn");
+const analyzeBtn = document.getElementById("analyzeBtn"); // must match HTML
 const canvas = document.getElementById("waveform");
 const ctx = canvas.getContext("2d");
 const output = document.getElementById("output");
 
-/* =======================
-   MAIN CLICK HANDLER
-======================= */
-analyzeBtn.addEventListener("click", async () => {
+analyzeBtn.addEventListener("click", analyze);
+
+// =========================
+// MAIN ANALYSIS PIPELINE
+// =========================
+async function analyze() {
   if (!fileInput.files.length) return;
   await audioCtx.resume();
 
@@ -20,43 +25,48 @@ analyzeBtn.addEventListener("click", async () => {
   resizeCanvas();
   drawWaveform(samples);
 
-  const clickTimes = detectClicks(samples, sr);
-  const analyzed = await analyzeClicks(samples, sr, clickTimes);
+  const clicks = detectClicks(samples, sr);
+  const events = analyzeCentroids(samples, sr, clicks);
 
-  const classified = classifyByCentroid(analyzed);
-  const tempoMap = buildTempoMap(classified);
+  const classified = classifyByCentroid(events);
+  const beatsPerBar = detectBeatsPerBar(classified.downbeats);
+  const tempoMap = segmentTempo(clicks);
 
-  drawBeatsOverlay(classified);
+  drawBeatOverlay(classified, samples.length, sr);
 
   output.textContent = JSON.stringify(
     {
-      beats: classified,
-      tempoMap
+      beatsDetected: clicks.length,
+      downbeats: classified.downbeats.length,
+      beatsPerBar,
+      tempoChanges: tempoMap
     },
     null,
     2
   );
-});
-
-/* =======================
-   AUDIO
-======================= */
-async function decode(file) {
-  return audioCtx.decodeAudioData(await file.arrayBuffer());
 }
 
-/* =======================
-   CLICK DETECTION
-======================= */
+// =========================
+// AUDIO DECODE
+// =========================
+async function decode(file) {
+  const data = await file.arrayBuffer();
+  return audioCtx.decodeAudioData(data);
+}
+
+// =========================
+// CLICK DETECTION
+// =========================
 function detectClicks(samples, sr) {
-  let max = 0;
+  let peak = 0;
   for (let i = 0; i < samples.length; i++) {
     const v = Math.abs(samples[i]);
-    if (v > max) max = v;
+    if (v > peak) peak = v;
   }
 
-  const threshold = max * 0.35;
+  const threshold = peak * 0.35;
   const minGap = 0.08;
+
   const clicks = [];
   let last = -Infinity;
 
@@ -69,143 +79,151 @@ function detectClicks(samples, sr) {
       last = t;
     }
   }
+
   return clicks;
 }
 
-/* =======================
-   FFT + CENTROID
-======================= */
-async function analyzeClicks(samples, sr, times) {
+// =========================
+// CENTROID ANALYSIS (SYNC, SAFE)
+// =========================
+function analyzeCentroids(samples, sr, times) {
+  const size = 2048;
   const results = [];
 
   for (const time of times) {
-    const centroid = await spectralCentroidAt(samples, sr, time);
+    const start = Math.floor(time * sr);
+    if (start + size >= samples.length) continue;
+
+    const window = samples.slice(start, start + size);
+    const centroid = spectralCentroid(window, sr);
     results.push({ time, centroid });
   }
+
   return results;
 }
 
-async function spectralCentroidAt(samples, sr, time) {
-  const size = 2048;
-  const start = Math.floor(time * sr);
-  if (start + size >= samples.length) return 0;
-
-  const offline = new OfflineAudioContext(1, size, sr);
-  const buffer = offline.createBuffer(1, size, sr);
-  buffer.copyToChannel(samples.slice(start, start + size), 0);
-
-  const src = offline.createBufferSource();
-  const analyser = offline.createAnalyser();
-  analyser.fftSize = size;
-
-  src.buffer = buffer;
-  src.connect(analyser);
-  analyser.connect(offline.destination);
-  src.start();
-
-  await offline.startRendering();
-
-  const data = new Float32Array(analyser.frequencyBinCount);
-  analyser.getFloatFrequencyData(data);
-
+function spectralCentroid(window, sr) {
   let weighted = 0;
   let total = 0;
 
-  for (let i = 0; i < data.length; i++) {
-    const mag = Math.pow(10, data[i] / 20);
-    const freq = i * sr / size;
-    weighted += freq * mag;
+  for (let i = 0; i < window.length; i++) {
+    const mag = Math.abs(window[i]);
+    weighted += i * mag;
     total += mag;
   }
 
-  return total ? weighted / total : 0;
+  if (!total) return 0;
+  return (weighted / total) * (sr / window.length);
 }
 
-/* =======================
-   CLASSIFICATION
-======================= */
+// =========================
+// DOWNBEAT CLASSIFICATION
+// =========================
 function classifyByCentroid(events) {
-  const centroids = events.map(e => e.centroid).sort((a,b)=>a-b);
-  const split = centroids[Math.floor(centroids.length / 2)];
+  const values = events.map(e => e.centroid);
+  const mean =
+    values.reduce((a, b) => a + b, 0) / values.length;
 
   const low = [];
   const high = [];
 
   events.forEach(e =>
-    (e.centroid < split ? low : high).push(e)
+    (e.centroid < mean ? low : high).push(e)
   );
 
-  const downbeats = low.length < high.length ? low : high;
-  const beats = low.length < high.length ? high : low;
-
-  return events.map(e => ({
-    ...e,
-    isDownbeat: downbeats.includes(e)
-  }));
+  return low.length < high.length
+    ? { downbeats: low, beats: high }
+    : { downbeats: high, beats: low };
 }
 
-/* =======================
-   TEMPO MAP
-======================= */
-function buildTempoMap(events, tolerance = 1) {
-  const map = [];
+// =========================
+// BEATS-PER-BAR DETECTION
+// =========================
+function detectBeatsPerBar(downbeats) {
+  if (downbeats.length < 2) return null;
+
+  const intervals = [];
+  for (let i = 1; i < downbeats.length; i++) {
+    intervals.push(downbeats[i].time - downbeats[i - 1].time);
+  }
+
+  const avgBar = intervals.reduce((a, b) => a + b, 0) / intervals.length;
+
+  // estimate beat length from overall clicks
+  const approxBeat = intervals[0] / 4;
+  const beatsPerBar = Math.round(avgBar / approxBeat);
+
+  return beatsPerBar;
+}
+
+// =========================
+// TEMPO CHANGE SEGMENTATION
+// =========================
+function segmentTempo(times, tolerance = 1) {
+  const changes = [];
   let lastBpm = null;
 
-  for (let i = 1; i < events.length; i++) {
-    const bpm = 60 / (events[i].time - events[i - 1].time);
+  for (let i = 1; i < times.length; i++) {
+    const bpm = 60 / (times[i] - times[i - 1]);
 
     if (!lastBpm || Math.abs(bpm - lastBpm) > tolerance) {
-      map.push({
-        time: events[i].time,
+      changes.push({
+        time: times[i],
         bpm: Math.round(bpm * 100) / 100
       });
       lastBpm = bpm;
     }
-
-    events[i].bpm = lastBpm;
   }
-  return map;
+
+  return changes;
 }
 
-/* =======================
-   VISUALIZATION
-======================= */
-function drawBeatsOverlay(events) {
-  const w = canvas.width;
-  const h = canvas.height;
-
-  ctx.save();
-  ctx.globalAlpha = 0.85;
-
-  events.forEach(e => {
-    const x = (e.time / events[events.length - 1].time) * w;
-    ctx.strokeStyle = e.isDownbeat ? "#ef4444" : "#38bdf8";
-    ctx.beginPath();
-    ctx.moveTo(x, 0);
-    ctx.lineTo(x, h);
-    ctx.stroke();
-  });
-
-  ctx.restore();
-}
-
-function resizeCanvas() {
-  canvas.width = canvas.clientWidth;
-  canvas.height = canvas.clientHeight;
-}
-
+// =========================
+// VISUALIZATION
+// =========================
 function drawWaveform(samples) {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
-  ctx.strokeStyle = "#64748b";
+  ctx.strokeStyle = "#38bdf8";
   ctx.beginPath();
 
   const step = Math.ceil(samples.length / canvas.width);
   const mid = canvas.height / 2;
 
   for (let x = 0; x < canvas.width; x++) {
-    const v = samples[x * step] || 0;
-    const y = mid + v * mid;
-    x === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    const s = samples[x * step] || 0;
+    ctx.lineTo(x, mid + s * mid);
   }
+
   ctx.stroke();
+}
+
+function drawBeatOverlay(classified, length, sr) {
+  const totalTime = length / sr;
+
+  classified.beats.forEach(b =>
+    drawMarker(b.time / totalTime, "#60a5fa", 1)
+  );
+
+  classified.downbeats.forEach(d =>
+    drawMarker(d.time / totalTime, "#f87171", 2)
+  );
+}
+
+function drawMarker(normX, color, width) {
+  const x = normX * canvas.width;
+  ctx.strokeStyle = color;
+  ctx.lineWidth = width;
+
+  ctx.beginPath();
+  ctx.moveTo(x, 0);
+  ctx.lineTo(x, canvas.height);
+  ctx.stroke();
+}
+
+// =========================
+// CANVAS
+// =========================
+function resizeCanvas() {
+  canvas.width = canvas.clientWidth;
+  canvas.height = canvas.clientHeight;
 }
