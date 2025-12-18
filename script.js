@@ -1,150 +1,285 @@
 (() => {
-  // ----------------------------
-  // DOM lookup (with fallbacks)
-  // ----------------------------
-  const $ = (id) => document.getElementById(id);
+  "use strict";
 
-  const fileInput =
-    $("fileInput") || document.querySelector('input[type="file"]');
-  const analyzeBtn =
-    $("processBtn") || $("analyze") || document.querySelector("button");
-  const canvas = $("waveform") || document.querySelector("canvas");
-  const output = $("output") || document.querySelector("pre");
-
-  // Optional controls (you said zoom works great already)
-  const zoomRange = $("zoomRange");   // expected type="range"
-  const scrollRange = $("scrollRange"); // expected type="range"
+  // ---------- DOM ----------
+  const fileInput = document.getElementById("fileInput");
+  const processBtn = document.getElementById("processBtn");
+  const canvas = document.getElementById("waveform");
+  const zoomEl = document.getElementById("zoom");
+  const output = document.getElementById("output");
 
   const missing = [];
   if (!fileInput) missing.push("fileInput");
-  if (!analyzeBtn) missing.push("processBtn/analyze button");
-  if (!canvas) missing.push("waveform canvas");
+  if (!processBtn) missing.push("processBtn");
+  if (!canvas) missing.push("waveform");
+  if (!zoomEl) missing.push("zoom");
   if (!output) missing.push("output");
-
   if (missing.length) {
     console.error("Missing required DOM elements:", missing.join(", "));
     return;
   }
 
-  const ctx = canvas.getContext("2d");
-  if (!ctx) {
-    console.error("Could not get 2D context from canvas.");
-    return;
+  // Create a bottom scrollbar if user didn't add one
+  let scrollEl = document.getElementById("scroll");
+  if (!scrollEl) {
+    scrollEl = document.createElement("input");
+    scrollEl.type = "range";
+    scrollEl.id = "scroll";
+    scrollEl.min = "0";
+    scrollEl.max = "1000";
+    scrollEl.step = "1";
+    scrollEl.value = "0";
+    scrollEl.style.width = "100%";
+    scrollEl.style.marginTop = "8px";
+    canvas.insertAdjacentElement("afterend", scrollEl);
   }
 
-  // ----------------------------
-  // Audio
-  // ----------------------------
+  const ctx = canvas.getContext("2d", { alpha: false });
+
+  // ---------- Audio ----------
   const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
 
-  // State
+  // ---------- State ----------
   let audioBuffer = null;
   let samples = null;
-  let sr = 44100;
-  let durationSec = 0;
+  let sampleRate = 44100;
 
-  // Analysis results
-  let clickTimes = [];
-  let events = []; // { time, centroid, cluster, isDownbeat, bpm? }
-  let segments = []; // tempo segments
+  // viewport in samples
+  let viewStart = 0;         // sample index
+  let viewLen = 0;           // sample count
+  let zoom = Number(zoomEl.value) || 1;
 
-  // View state (zoom/scroll)
-  let view = {
-    zoom: 1,           // 1..N (higher = more zoom)
-    windowSec: 10,     // visible window length in seconds
-    startSec: 0        // window start time
-  };
+  // analysis results
+  let clicks = [];           // [{time, sampleIndex, centroid}]
+  let classification = null; // { beatsPerBar, downbeats, beats, tempoSegments }
 
-  // ----------------------------
-  // Helpers: rounding / formatting
-  // ----------------------------
+  // ---------- Helpers ----------
+  const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
   const r3 = (x) => Math.round(x * 1000) / 1000;
   const r1 = (x) => Math.round(x * 10) / 10;
 
-  // ----------------------------
-  // UI: canvas sizing
-  // ----------------------------
-  function resizeCanvas() {
+  function setStatus(text) {
+    output.textContent = text;
+  }
+
+  function setError(err) {
+    console.error(err);
+    output.textContent = String(err?.message || err);
+  }
+
+  function ensureCanvasSize() {
+    // Keep canvas drawing buffer in sync with its CSS size for sharp rendering.
     const dpr = window.devicePixelRatio || 1;
-    const w = canvas.clientWidth || 800;
-    const h = canvas.clientHeight || 220;
-    canvas.width = Math.floor(w * dpr);
-    canvas.height = Math.floor(h * dpr);
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0); // draw in CSS pixels
-  }
-
-  window.addEventListener("resize", () => {
-    if (!samples) return;
-    resizeCanvas();
-    draw();
-  });
-
-  // ----------------------------
-  // Decode
-  // ----------------------------
-  async function decodeFile(file) {
-    const data = await file.arrayBuffer();
-    // Safari sometimes needs a copy
-    const buf = await audioCtx.decodeAudioData(data.slice(0));
-    return buf;
-  }
-
-  function getMonoSamples(buffer) {
-    if (buffer.numberOfChannels === 1) return buffer.getChannelData(0);
-
-    // Mixdown stereo -> mono
-    const ch0 = buffer.getChannelData(0);
-    const ch1 = buffer.getChannelData(1);
-    const mono = new Float32Array(buffer.length);
-    for (let i = 0; i < mono.length; i++) mono[i] = 0.5 * (ch0[i] + ch1[i]);
-    return mono;
-  }
-
-  // ----------------------------
-  // Click detection (no spread ops)
-  // ----------------------------
-  function detectClicks(samples, sr, opts = {}) {
-    const minGap = opts.minGap ?? 0.08; // seconds
-    const threshPct = opts.threshPct ?? 0.35;
-
-    // Find max abs without Math.max(...arr) (avoids call stack overflow)
-    let maxAbs = 0;
-    for (let i = 0; i < samples.length; i++) {
-      const a = Math.abs(samples[i]);
-      if (a > maxAbs) maxAbs = a;
+    const cssW = canvas.clientWidth || 800;
+    const cssH = canvas.clientHeight || 200;
+    const w = Math.floor(cssW * dpr);
+    const h = Math.floor(cssH * dpr);
+    if (canvas.width !== w || canvas.height !== h) {
+      canvas.width = w;
+      canvas.height = h;
     }
-    const threshold = maxAbs * threshPct;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+  }
+
+  function updateViewport() {
+    if (!samples) return;
+
+    zoom = Number(zoomEl.value) || 1;
+    zoom = clamp(zoom, 1, 200);
+
+    // Show 1/zoom of the file in the viewport (with a cap for usability)
+    const total = samples.length;
+
+    // Minimum visible window: ~0.25s
+    const minLen = Math.max(1, Math.floor(sampleRate * 0.25));
+    const targetLen = Math.floor(total / zoom);
+    viewLen = clamp(targetLen, minLen, total);
+
+    // clamp start
+    viewStart = clamp(viewStart, 0, total - viewLen);
+
+    // Update scrollbar range *in samples*.
+    // We use 0..(total-viewLen) mapped to 0..100000 for smoothness.
+    const maxStart = Math.max(0, total - viewLen);
+    const rangeMax = 100000;
+
+    // Preserve relative position (prevents “jump to end” when zoom changes)
+    const prevMaxStart = Number(scrollEl.dataset.maxStart || maxStart);
+    const prevValue = Number(scrollEl.value || 0);
+
+    // Convert previous slider -> previous start ratio
+    const prevRatio = prevMaxStart > 0 ? (prevValue / rangeMax) : 0;
+
+    scrollEl.dataset.maxStart = String(maxStart);
+    scrollEl.max = String(rangeMax);
+
+    // If user isn't actively dragging, keep their relative position.
+    if (!scrollEl.dataset.dragging) {
+      const newVal = Math.round(prevRatio * rangeMax);
+      scrollEl.value = String(clamp(newVal, 0, rangeMax));
+      viewStart = Math.round(prevRatio * maxStart);
+    } else {
+      // if dragging, trust viewStart derived from slider
+      const ratio = Number(scrollEl.value) / rangeMax;
+      viewStart = Math.round(ratio * maxStart);
+    }
+  }
+
+  function sliderToViewStart() {
+    if (!samples) return;
+    const maxStart = Math.max(0, samples.length - viewLen);
+    const rangeMax = Number(scrollEl.max) || 100000;
+    const ratio = rangeMax > 0 ? Number(scrollEl.value) / rangeMax : 0;
+    viewStart = Math.round(ratio * maxStart);
+  }
+
+  // ---------- Waveform drawing ----------
+  function draw() {
+    if (!samples) return;
+    ensureCanvasSize();
+    updateViewport();
+
+    const W = canvas.width;
+    const H = canvas.height;
+    const mid = H / 2;
+
+    // Background
+    ctx.fillStyle = "#020617";
+    ctx.fillRect(0, 0, W, H);
+
+    // Waveform
+    ctx.strokeStyle = "#38bdf8";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+
+    const start = viewStart;
+    const end = viewStart + viewLen;
+
+    // Downsample: one column per x pixel
+    const step = Math.max(1, Math.floor(viewLen / W));
+
+    for (let x = 0; x < W; x++) {
+      const s0 = start + x * step;
+      if (s0 >= end) break;
+
+      // min/max envelope within this column
+      let min = 1, max = -1;
+      const s1 = Math.min(s0 + step, end);
+      for (let i = s0; i < s1; i++) {
+        const v = samples[i] || 0;
+        if (v < min) min = v;
+        if (v > max) max = v;
+      }
+
+      const y1 = mid + min * mid;
+      const y2 = mid + max * mid;
+
+      // draw a vertical line segment for envelope
+      ctx.moveTo(x + 0.5, y1);
+      ctx.lineTo(x + 0.5, y2);
+    }
+    ctx.stroke();
+
+    // Overlay beats/downbeats
+    if (clicks?.length) {
+      const viewStartTime = start / sampleRate;
+      const viewEndTime = end / sampleRate;
+
+      // beats
+      ctx.globalAlpha = 0.8;
+      ctx.lineWidth = 1;
+
+      for (const c of clicks) {
+        if (c.time < viewStartTime || c.time > viewEndTime) continue;
+        const x = ((c.time - viewStartTime) / (viewEndTime - viewStartTime)) * W;
+
+        const isDown = classification?.downbeatsSet?.has(c.sampleIndex);
+
+        ctx.strokeStyle = isDown ? "#f59e0b" : "#94a3b8"; // downbeat amber, others gray
+        ctx.beginPath();
+        ctx.moveTo(x + 0.5, 0);
+        ctx.lineTo(x + 0.5, H);
+        ctx.stroke();
+      }
+
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  // ---------- Click detection ----------
+  function detectClicksAdaptive(samples, sr) {
+    // Avoid Math.max(...bigArray) stack overflow.
+    // Use peak-based adaptive threshold from sampled absolute amplitude.
+    let peak = 0;
+    const n = samples.length;
+    const stride = Math.max(1, Math.floor(n / 200000)); // sample up to ~200k points
+    for (let i = 0; i < n; i += stride) {
+      const v = Math.abs(samples[i]);
+      if (v > peak) peak = v;
+    }
+
+    const threshold = peak * 0.35; // adjust if needed
+    const minGapSec = 0.08;        // 80ms guard against double-triggers
+    const minGap = Math.floor(minGapSec * sr);
 
     const clicks = [];
-    let last = -Infinity;
+    let last = -minGap;
 
-    for (let i = 0; i < samples.length; i++) {
+    // Basic transient detector: first sample crossing threshold after gap.
+    for (let i = 0; i < n; i++) {
       const v = Math.abs(samples[i]);
-      if (v < threshold) continue;
+      if (v > threshold && (i - last) > minGap) {
+        // refine to local maximum around i within small window
+        const refine = Math.floor(0.01 * sr); // 10ms
+        const a = i;
+        const b = Math.min(n - 1, i + refine);
+        let bestI = a;
+        let bestV = v;
+        for (let k = a; k <= b; k++) {
+          const vv = Math.abs(samples[k]);
+          if (vv > bestV) {
+            bestV = vv;
+            bestI = k;
+          }
+        }
 
-      const t = i / sr;
-      if (t - last > minGap) {
-        clicks.push(t);
-        last = t;
+        clicks.push({ time: bestI / sr, sampleIndex: bestI });
+        last = bestI;
+        i = bestI; // skip forward slightly
       }
     }
+
     return clicks;
   }
 
-  // ----------------------------
-  // FFT centroid (band-limited) to keep values meaningful
-  // ----------------------------
-  async function centroidForClick(samples, sr, time, opts = {}) {
-    const fftSize = opts.fftSize ?? 2048;
-    const start = Math.floor(time * sr);
+  // ---------- Centroid analysis ----------
+  function hannWindow(N) {
+    const w = new Float32Array(N);
+    for (let n = 0; n < N; n++) {
+      w[n] = 0.5 * (1 - Math.cos((2 * Math.PI * n) / (N - 1)));
+    }
+    return w;
+  }
 
-    if (start + fftSize >= samples.length) return 0;
+  const HANN_2048 = hannWindow(2048);
+
+  async function centroidAt(samples, sr, sampleIndex, fftSize = 2048) {
+    if (sampleIndex + fftSize >= samples.length) return 0;
+
+    // band-limit centroid to a more useful click tone region
+    // (helps prevent “everything ~7400Hz” behavior if high-frequency noise dominates)
+    const fMin = 200;   // Hz
+    const fMax = 6000;  // Hz
 
     const offline = new OfflineAudioContext(1, fftSize, sr);
     const buf = offline.createBuffer(1, fftSize, sr);
 
-    // copy slice
-    const slice = samples.subarray(start, start + fftSize);
+    const slice = new Float32Array(fftSize);
+    const win = (fftSize === 2048) ? HANN_2048 : hannWindow(fftSize);
+
+    for (let i = 0; i < fftSize; i++) {
+      slice[i] = (samples[sampleIndex + i] || 0) * win[i];
+    }
     buf.copyToChannel(slice, 0);
 
     const src = offline.createBufferSource();
@@ -154,426 +289,307 @@
     src.buffer = buf;
     src.connect(analyser);
     analyser.connect(offline.destination);
-    src.start(0);
+    src.start();
 
     await offline.startRendering();
 
     const freqData = new Float32Array(analyser.frequencyBinCount);
-    analyser.getFloatFrequencyData(freqData); // dB values
+    analyser.getFloatFrequencyData(freqData);
 
-    // Band-limit centroid to reduce "everything ~7400Hz" issues
-    // Typical click tones often sit between a few hundred Hz and a few kHz.
-    return spectralCentroidBand(freqData, sr, fftSize, 300, 5000);
-  }
+    // Spectral centroid (band-limited, dB -> linear)
+    let weighted = 0;
+    let sum = 0;
 
-  function spectralCentroidBand(freqDataDb, sampleRate, fftSize, fMin, fMax) {
-    const binHz = sampleRate / fftSize;
+    const binHz = sr / fftSize;
+    const iMin = Math.max(0, Math.floor(fMin / binHz));
+    const iMax = Math.min(freqData.length - 1, Math.ceil(fMax / binHz));
 
-    let iMin = Math.floor(fMin / binHz);
-    let iMax = Math.ceil(fMax / binHz);
-    iMin = Math.max(0, Math.min(iMin, freqDataDb.length - 1));
-    iMax = Math.max(0, Math.min(iMax, freqDataDb.length - 1));
-
-    let weightedSum = 0;
-    let magSum = 0;
-
-    // Convert dB -> linear magnitude; clamp super-low values
     for (let i = iMin; i <= iMax; i++) {
-      const db = freqDataDb[i];
-      // ignore bins far below noise floor
+      const db = freqData[i];
+      // ignore -Infinity and very low values
       if (!Number.isFinite(db) || db < -120) continue;
-
       const mag = Math.pow(10, db / 20);
-      const freq = i * binHz;
-
-      weightedSum += freq * mag;
-      magSum += mag;
+      const f = i * binHz;
+      weighted += f * mag;
+      sum += mag;
     }
 
-    return magSum ? (weightedSum / magSum) : 0;
+    return sum > 0 ? (weighted / sum) : 0;
   }
 
-  // ----------------------------
-  // 2-means clustering (k=2) on centroid feature
-  // ----------------------------
+  // ---------- Classification ----------
   function kmeans2(values, iters = 20) {
     // values: number[]
-    const clean = values.filter(v => Number.isFinite(v));
-    if (clean.length < 2) return { centers: [0, 0], labels: values.map(() => 0) };
-
-    // init centers: min & max (robust for 2 clusters)
-    let c0 = Math.min(...clean);
-    let c1 = Math.max(...clean);
-
-    // Edge case: all same
-    if (Math.abs(c1 - c0) < 1e-6) {
-      return { centers: [c0, c1], labels: values.map(() => 0) };
+    if (values.length < 2) {
+      return { c1: values[0] || 0, c2: values[0] || 0, labels: values.map(() => 0) };
     }
 
+    // init centers near 25% and 75% percentiles
+    const sorted = [...values].sort((a, b) => a - b);
+    const c1init = sorted[Math.floor(sorted.length * 0.25)];
+    const c2init = sorted[Math.floor(sorted.length * 0.75)];
+
+    let c1 = c1init;
+    let c2 = c2init;
     let labels = new Array(values.length).fill(0);
 
-    for (let iter = 0; iter < iters; iter++) {
+    for (let t = 0; t < iters; t++) {
+      let s1 = 0, n1 = 0, s2 = 0, n2 = 0;
+
       // assign
       for (let i = 0; i < values.length; i++) {
         const v = values[i];
-        if (!Number.isFinite(v)) { labels[i] = 0; continue; }
-        const d0 = Math.abs(v - c0);
         const d1 = Math.abs(v - c1);
-        labels[i] = d0 <= d1 ? 0 : 1;
+        const d2 = Math.abs(v - c2);
+        const lab = d1 <= d2 ? 0 : 1;
+        labels[i] = lab;
+        if (lab === 0) { s1 += v; n1++; } else { s2 += v; n2++; }
       }
 
-      // recompute centers
-      let s0 = 0, n0 = 0, s1 = 0, n1 = 0;
-      for (let i = 0; i < values.length; i++) {
-        const v = values[i];
-        if (!Number.isFinite(v)) continue;
-        if (labels[i] === 0) { s0 += v; n0++; }
-        else { s1 += v; n1++; }
+      // update (avoid empty cluster collapse)
+      if (n1 > 0) c1 = s1 / n1;
+      if (n2 > 0) c2 = s2 / n2;
+
+      // if one cluster empty, break
+      if (n1 === 0 || n2 === 0) break;
+    }
+
+    return { c1, c2, labels };
+  }
+
+  function inferBeatsPerBar(clicks, labels, preferMinority = true) {
+    // Determine which label likely corresponds to downbeats: minority cluster by count.
+    const count0 = labels.filter(l => l === 0).length;
+    const count1 = labels.length - count0;
+
+    let downLabel = 0;
+    if (preferMinority) downLabel = (count0 <= count1) ? 0 : 1;
+
+    // Compute distance between downLabel events in number of clicks
+    const idxs = [];
+    for (let i = 0; i < labels.length; i++) {
+      if (labels[i] === downLabel) idxs.push(i);
+    }
+    if (idxs.length < 2) return { beatsPerBar: 4, downLabel };
+
+    const gaps = [];
+    for (let i = 1; i < idxs.length; i++) gaps.push(idxs[i] - idxs[i - 1]);
+
+    // mode of gaps in a reasonable range
+    const hist = new Map();
+    for (const g of gaps) {
+      if (g < 2 || g > 16) continue;
+      hist.set(g, (hist.get(g) || 0) + 1);
+    }
+    let best = 4, bestCount = -1;
+    for (const [g, c] of hist.entries()) {
+      if (c > bestCount) { best = g; bestCount = c; }
+    }
+    return { beatsPerBar: best, downLabel };
+  }
+
+  function alignDownbeatsByPhase(clicks, labels, beatsPerBar, downLabel) {
+    // Sometimes k-means labels are correct (two tones) but “which one is downbeat”
+    // and the phase can drift. We choose a phase that maximizes agreement with downLabel.
+    // That gives stable true/false.
+    if (!beatsPerBar || beatsPerBar < 2) beatsPerBar = 4;
+
+    // Choose phase 0..beatsPerBar-1
+    let bestPhase = 0;
+    let bestScore = -Infinity;
+
+    for (let phase = 0; phase < beatsPerBar; phase++) {
+      let score = 0;
+      for (let i = 0; i < labels.length; i++) {
+        const isGridDown = ((i - phase) % beatsPerBar === 0);
+        const isToneDown = (labels[i] === downLabel);
+        if (isGridDown && isToneDown) score += 2;
+        else if (isGridDown && !isToneDown) score -= 1;
+        else if (!isGridDown && isToneDown) score -= 0.5;
       }
-
-      const newC0 = n0 ? s0 / n0 : c0;
-      const newC1 = n1 ? s1 / n1 : c1;
-
-      if (Math.abs(newC0 - c0) < 1e-6 && Math.abs(newC1 - c1) < 1e-6) break;
-      c0 = newC0; c1 = newC1;
-    }
-
-    return { centers: [c0, c1], labels };
-  }
-
-  // ----------------------------
-  // Tempo segmentation (BPM per interval, then merge into segments)
-  // ----------------------------
-  function computeBpms(times) {
-    const bpms = new Array(times.length).fill(null);
-    for (let i = 1; i < times.length; i++) {
-      const dt = times[i] - times[i - 1];
-      if (dt > 0) bpms[i] = 60 / dt;
-    }
-    return bpms;
-  }
-
-  function segmentTempo(times, bpms, tolBpm = 0.8) {
-    const segs = [];
-    if (times.length < 2) return segs;
-
-    let segStartIdx = 1;
-    let segBpm = bpms[1] ?? 0;
-
-    for (let i = 2; i < times.length; i++) {
-      const b = bpms[i];
-      if (!Number.isFinite(b)) continue;
-
-      if (Math.abs(b - segBpm) > tolBpm) {
-        segs.push({
-          startTime: times[segStartIdx],
-          endTime: times[i - 1],
-          bpm: segBpm
-        });
-        segStartIdx = i;
-        segBpm = b;
-      } else {
-        // slowly track segment bpm (light smoothing)
-        segBpm = 0.9 * segBpm + 0.1 * b;
+      if (score > bestScore) {
+        bestScore = score;
+        bestPhase = phase;
       }
     }
 
-    segs.push({
-      startTime: times[segStartIdx],
-      endTime: times[times.length - 1],
-      bpm: segBpm
-    });
-
-    // round
-    return segs.map(s => ({
-      startTime: r3(s.startTime),
-      endTime: r3(s.endTime),
-      bpm: r1(s.bpm)
-    }));
+    // Build final downbeat set based on chosen phase (grid)
+    const downbeatsSet = new Set();
+    for (let i = 0; i < clicks.length; i++) {
+      const isDown = ((i - bestPhase) % beatsPerBar === 0);
+      if (isDown) downbeatsSet.add(clicks[i].sampleIndex);
+    }
+    return { bestPhase, downbeatsSet };
   }
 
-  // ----------------------------
-  // Beats-per-bar detection (2..8) + downbeat choice
-  // ----------------------------
-  function detectBeatsPerBarAndDownbeat(events, labels) {
-    // labels are 0/1 clusters. We'll score which cluster forms the "downbeat"
-    // by checking periodicity at candidate beats-per-bar.
-    const N = events.length;
-    if (N < 8) {
-      // fallback: minority cluster is downbeats
-      const count0 = labels.filter(x => x === 0).length;
-      const count1 = N - count0;
-      const down = count0 <= count1 ? 0 : 1;
-      return { beatsPerBar: null, downbeatCluster: down };
+  // ---------- Tempo segmentation ----------
+  function detectTempoSegments(clicks, toleranceBpm = 1.0, minBeatsPerSeg = 4) {
+    if (clicks.length < 2) return [];
+
+    // Instant BPM per interval
+    const bpms = [];
+    for (let i = 1; i < clicks.length; i++) {
+      const dt = clicks[i].time - clicks[i - 1].time;
+      bpms.push(dt > 0 ? 60 / dt : 0);
     }
 
-    // Candidate beats-per-bar
-    const candidates = [2, 3, 4, 5, 6, 7, 8];
+    // Median smoothing (window 5)
+    const smooth = [];
+    const w = 5;
+    for (let i = 0; i < bpms.length; i++) {
+      const a = Math.max(0, i - Math.floor(w / 2));
+      const b = Math.min(bpms.length - 1, i + Math.floor(w / 2));
+      const slice = bpms.slice(a, b + 1).sort((x, y) => x - y);
+      smooth.push(slice[Math.floor(slice.length / 2)]);
+    }
 
-    function periodicScore(clusterId, bpb) {
-      // Expect downbeats roughly every bpb beats:
-      // compute hits when index% bpb == 0 for that cluster.
-      let hits = 0;
-      let total = 0;
-      for (let i = 0; i < N; i++) {
-        if (i % bpb !== 0) continue;
-        total++;
-        if (labels[i] === clusterId) hits++;
+    const segments = [];
+    let segStartBeat = 0;
+    let segBpm = smooth[0] || 0;
+
+    function closeSegment(endBeatExclusive) {
+      const beats = endBeatExclusive - segStartBeat;
+      if (beats < minBeatsPerSeg) return;
+      const time = clicks[segStartBeat].time;
+      segments.push({ time: r3(time), bpm: r1(segBpm) });
+    }
+
+    for (let i = 1; i < smooth.length; i++) {
+      const bpm = smooth[i];
+      if (Math.abs(bpm - segBpm) > toleranceBpm) {
+        closeSegment(i);
+        segStartBeat = i;
+        segBpm = bpm;
       }
-      if (!total) return 0;
-      // prefer both high hit-rate and being relatively rare overall
-      const rate = hits / total;
-      const rarity = 1 - (labels.filter(x => x === clusterId).length / N);
-      return rate * 0.8 + rarity * 0.2;
+    }
+    closeSegment(smooth.length);
+
+    // Always include first segment (even if short)
+    if (!segments.length && smooth.length) {
+      segments.push({ time: r3(clicks[0].time), bpm: r1(smooth[0]) });
     }
 
-    let best = { score: -Infinity, bpb: null, downCluster: 0 };
-
-    for (const bpb of candidates) {
-      const s0 = periodicScore(0, bpb);
-      const s1 = periodicScore(1, bpb);
-
-      if (s0 > best.score) best = { score: s0, bpb, downCluster: 0 };
-      if (s1 > best.score) best = { score: s1, bpb, downCluster: 1 };
-    }
-
-    // If the best score is weak, fallback to minority
-    if (best.score < 0.35) {
-      const count0 = labels.filter(x => x === 0).length;
-      const count1 = N - count0;
-      const down = count0 <= count1 ? 0 : 1;
-      return { beatsPerBar: null, downbeatCluster: down };
-    }
-
-    return { beatsPerBar: best.bpb, downbeatCluster: best.downCluster };
+    return segments;
   }
 
-  // ----------------------------
-  // Waveform drawing (zoom + scroll + overlays)
-  // ----------------------------
-  function computeWindowSec() {
-    // base window is 12 seconds at zoom=1, smaller window when zoom increases
-    const base = 12;
-    const z = Math.max(1, view.zoom);
-    return Math.max(0.5, base / z);
-  }
-
-  function clampView() {
-    view.windowSec = computeWindowSec();
-    const maxStart = Math.max(0, durationSec - view.windowSec);
-    view.startSec = Math.max(0, Math.min(view.startSec, maxStart));
-  }
-
-  function updateScrollRangeFromView(preserveRatio = true) {
-    if (!scrollRange) return;
-
-    const prevMax = Number(scrollRange.max || 0);
-    const prevVal = Number(scrollRange.value || 0);
-    const prevRatio = prevMax > 0 ? prevVal / prevMax : 0;
-
-    const maxStart = Math.max(0, durationSec - view.windowSec);
-
-    // Range maps directly to startSec * 1000 to keep precision stable
-    scrollRange.min = 0;
-    scrollRange.max = Math.floor(maxStart * 1000);
-    scrollRange.step = 1;
-
-    if (preserveRatio) {
-      scrollRange.value = Math.floor(prevRatio * Number(scrollRange.max || 0));
-      view.startSec = (Number(scrollRange.value) || 0) / 1000;
-      clampView();
-    } else {
-      scrollRange.value = Math.floor(view.startSec * 1000);
-    }
-  }
-
-  function draw() {
-    if (!samples) return;
-
-    clampView();
-    resizeCanvas();
-
-    const w = canvas.clientWidth || 800;
-    const h = canvas.clientHeight || 220;
-
-    // background
-    ctx.clearRect(0, 0, w, h);
-    ctx.fillStyle = "#020617";
-    ctx.fillRect(0, 0, w, h);
-
-    // visible sample bounds
-    const startSamp = Math.floor(view.startSec * sr);
-    const endSamp = Math.min(samples.length, Math.floor((view.startSec + view.windowSec) * sr));
-    const span = Math.max(1, endSamp - startSamp);
-
-    // waveform
-    ctx.strokeStyle = "#38bdf8";
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-
-    const mid = h / 2;
-    const step = Math.max(1, Math.floor(span / w));
-
-    for (let x = 0; x < w; x++) {
-      const idx = startSamp + x * step;
-      if (idx >= endSamp) break;
-      const s = samples[idx] || 0;
-      const y = mid + s * mid;
-      if (x === 0) ctx.moveTo(x, y);
-      else ctx.lineTo(x, y);
-    }
-    ctx.stroke();
-
-    // overlays: beat markers
-    drawBeatMarkers(w, h);
-
-    // top info
-    ctx.fillStyle = "#e2e8f0";
-    ctx.font = "12px system-ui";
-    ctx.fillText(
-      `view: ${r3(view.startSec)}s → ${r3(view.startSec + view.windowSec)}s  (zoom ${view.zoom.toFixed(2)}x)`,
-      10, 16
-    );
-  }
-
-  function drawBeatMarkers(w, h) {
-    if (!events || !events.length) return;
-
-    const start = view.startSec;
-    const end = view.startSec + view.windowSec;
-
-    for (const e of events) {
-      if (e.time < start || e.time > end) continue;
-
-      const x = ((e.time - start) / view.windowSec) * w;
-
-      // downbeats vs beats
-      ctx.strokeStyle = e.isDownbeat ? "#fb7185" : "#22c55e";
-      ctx.globalAlpha = e.isDownbeat ? 0.95 : 0.55;
-      ctx.lineWidth = e.isDownbeat ? 2 : 1;
-
-      ctx.beginPath();
-      ctx.moveTo(x, 0);
-      ctx.lineTo(x, h);
-      ctx.stroke();
-    }
-
-    ctx.globalAlpha = 1;
-    ctx.lineWidth = 1;
-  }
-
-  // ----------------------------
-  // Control listeners (zoom + scroll)
-  // ----------------------------
-  if (zoomRange) {
-    zoomRange.addEventListener("input", () => {
-      // preserve current view center when zoom changes
-      const center = view.startSec + view.windowSec / 2;
-
-      view.zoom = Number(zoomRange.value) || 1;
-      view.windowSec = computeWindowSec();
-
-      view.startSec = center - view.windowSec / 2;
-      clampView();
-      updateScrollRangeFromView(false); // set scroll to match new startSec
-      draw();
-    });
-  }
-
-  if (scrollRange) {
-    scrollRange.addEventListener("input", () => {
-      view.startSec = (Number(scrollRange.value) || 0) / 1000;
-      clampView();
-      draw();
-    });
-  }
-
-  // ----------------------------
-  // Main Analyze
-  // ----------------------------
-  analyzeBtn.addEventListener("click", async () => {
+  // ---------- Main analyze ----------
+  async function analyze() {
     try {
-      if (!fileInput.files || !fileInput.files.length) return;
-
-      await audioCtx.resume();
-
-      const file = fileInput.files[0];
-      output.textContent = "Decoding audio…";
-
-      audioBuffer = await decodeFile(file);
-      sr = audioBuffer.sampleRate;
-      durationSec = audioBuffer.duration;
-
-      samples = getMonoSamples(audioBuffer);
-
-      // init view
-      view.zoom = zoomRange ? (Number(zoomRange.value) || 1) : 1;
-      view.windowSec = computeWindowSec();
-      view.startSec = 0;
-
-      updateScrollRangeFromView(false);
-      draw();
-
-      // 1) detect clicks
-      output.textContent = "Detecting clicks…";
-      clickTimes = detectClicks(samples, sr, { minGap: 0.08, threshPct: 0.35 });
-
-      if (clickTimes.length < 2) {
-        output.textContent = "No clicks detected. Try lowering threshold (threshPct) or minGap.";
+      if (!fileInput.files?.length) {
+        setStatus("Choose a .wav or .mp3 first.");
         return;
       }
 
-      // 2) centroid per click
-      output.textContent = `Analyzing ${clickTimes.length} clicks (centroid)…`;
-      events = [];
-      for (let i = 0; i < clickTimes.length; i++) {
-        const t = clickTimes[i];
-        const c = await centroidForClick(samples, sr, t, { fftSize: 2048 });
-        events.push({ time: t, centroid: c });
-      }
+      setStatus("Decoding audio…");
+      await audioCtx.resume();
 
-      // 3) cluster centroids
-      const centroids = events.map(e => e.centroid);
-      const { centers, labels } = kmeans2(centroids, 25);
+      const file = fileInput.files[0];
+      audioBuffer = await decodeAudio(file);
+      sampleRate = audioBuffer.sampleRate;
 
-      // 4) beats-per-bar + choose downbeat cluster
-      const { beatsPerBar, downbeatCluster } = detectBeatsPerBarAndDownbeat(events, labels);
+      // Use mono channel 0
+      samples = audioBuffer.getChannelData(0);
 
-      // apply labels
-      for (let i = 0; i < events.length; i++) {
-        events[i].cluster = labels[i];
-        events[i].isDownbeat = labels[i] === downbeatCluster;
-      }
-
-      // 5) tempo segmentation
-      const bpms = computeBpms(clickTimes);
-      segments = segmentTempo(clickTimes, bpms, 0.8);
-
-      // update scroll max (in case duration changes)
-      updateScrollRangeFromView(false);
+      // init viewport
+      viewStart = 0;
+      updateViewport();
       draw();
 
-      // Output (rounded formatting)
-      const out = {
-        meta: {
-          sampleRate: sr,
-          durationSec: r3(durationSec),
-          clicks: clickTimes.length,
-          centroidCenters: centers.map(r1),
-          beatsPerBar: beatsPerBar ?? null
-        },
-        tempoSegments: segments,
-        events: events.map(e => ({
-          time: r3(e.time),
-          centroid: r1(e.centroid),
-          downbeat: !!e.isDownbeat
-        }))
+      setStatus("Detecting clicks…");
+      const detected = detectClicksAdaptive(samples, sampleRate);
+
+      setStatus(`Found ${detected.length} clicks. Calculating centroids…`);
+      // centroid per click
+      clicks = [];
+      for (let i = 0; i < detected.length; i++) {
+        const c = detected[i];
+        const centroid = await centroidAt(samples, sampleRate, c.sampleIndex, 2048);
+        clicks.push({ ...c, centroid });
+      }
+
+      // k-means on centroid values
+      const values = clicks.map(c => c.centroid);
+      const km = kmeans2(values);
+      const labels = km.labels;
+
+      // beats-per-bar inference and robust downbeat labeling
+      const { beatsPerBar, downLabel } = inferBeatsPerBar(clicks, labels, true);
+      const { bestPhase, downbeatsSet } = alignDownbeatsByPhase(clicks, labels, beatsPerBar, downLabel);
+
+      // Build result arrays
+      const downbeats = [];
+      const beats = [];
+      for (let i = 0; i < clicks.length; i++) {
+        const item = {
+          time: r3(clicks[i].time),
+          centroid: r1(clicks[i].centroid),
+          downbeat: downbeatsSet.has(clicks[i].sampleIndex)
+        };
+        (item.downbeat ? downbeats : beats).push(item);
+      }
+
+      // Tempo segmentation
+      const tempoSegments = detectTempoSegments(clicks, 1.0, 4);
+
+      classification = {
+        beatsPerBar,
+        bestPhase,
+        downbeatsSet,
+        tempoSegments,
+        // helpful diagnostics:
+        clusterCenters: { c1: r1(km.c1), c2: r1(km.c2) },
+        downbeatClusterLabel: downLabel
       };
 
-      output.textContent = JSON.stringify(out, null, 2);
-    } catch (err) {
-      console.error(err);
-      output.textContent = `Error: ${err?.message || err}`;
+      // Redraw with overlay
+      draw();
+
+      // Output (rounded)
+      setStatus(
+        JSON.stringify(
+          {
+            beatsPerBar,
+            tempoSegments,
+            clusters: classification.clusterCenters,
+            phase: bestPhase,
+            downbeats,
+            beats
+          },
+          null,
+          2
+        )
+      );
+    } catch (e) {
+      setError(e);
     }
+  }
+
+  async function decodeAudio(file) {
+    const data = await file.arrayBuffer();
+    return await audioCtx.decodeAudioData(data);
+  }
+
+  // ---------- Events ----------
+  processBtn.addEventListener("click", analyze);
+
+  zoomEl.addEventListener("input", () => {
+    // keep current relative position on zoom change
+    updateViewport();
+    draw();
   });
+
+  scrollEl.addEventListener("input", () => {
+    scrollEl.dataset.dragging = "1";
+    sliderToViewStart();
+    draw();
+  });
+
+  scrollEl.addEventListener("change", () => {
+    // end drag
+    delete scrollEl.dataset.dragging;
+    updateViewport();
+    draw();
+  });
+
+  window.addEventListener("resize", () => draw());
 })();
