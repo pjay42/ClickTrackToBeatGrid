@@ -265,7 +265,7 @@
     return { beatsPerBar: best.bpb, beats: out };
   }
 
-  // Compute BPM per beat, detect tempo-change “outputs” per your rules
+  // Compute BPM per beat
   function computeTempoOutputs(beats) {
     // bpm at beat i = 60 / (t[i] - t[i-1]) for i>=1
     const out = beats.map((b, i) => {
@@ -291,7 +291,7 @@
       }
       
       // emit only if next beat differs by more than 1 BPM
-      if (rounded && Math.abs(nextBpm - rounded) > 1) {
+      if (i === 0 || (rounded && Math.abs(nextBpm - rounded) > 1)) {
         tempoOut = rounded;
       }
 
@@ -458,8 +458,6 @@ ctx2d.stroke();
       return;
     }
 
-    // Chronological list, one per line
-    // {sec(3dp), downbeat(1/0), tempo(1dp or 0)}
     const lines = [];
     lines.push("beatTable preview:");
     lines.push("{seconds, downbeat, tempo change}");
