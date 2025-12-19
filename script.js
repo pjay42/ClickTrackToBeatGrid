@@ -1,3 +1,15 @@
+
+
+  function updateControlReadouts() {
+    const zv = document.getElementById("zoomVal");
+    if (zv && zoomEl) zv.textContent = `${Number(zoomEl.value) || 1}×`;
+
+    const sv = document.getElementById("scrollVal");
+    if (sv && scrollEl) {
+      const pct = Math.round((Number(scrollEl.value) || 0) / 10);
+      sv.textContent = `${pct}%`;
+    }
+  }
 // Click Track → grandMA3 Beat Grid (MA3 plugin XML generator)
 // Drop-in script.js
 (() => {
@@ -9,7 +21,6 @@
   const canvas = document.getElementById("waveform");
   const output = document.getElementById("output");
   const zoomEl = document.getElementById("zoom");
-  const zoomValEl = document.getElementById("zoomVal");
 
   if (!fileInput || !processBtn || !canvas || !output) {
     console.error("Missing required DOM elements: fileInput, processBtn, waveform, output");
@@ -29,7 +40,6 @@
 
   // Create scroll slider if not present (bottom navigation)
   let scrollEl = document.getElementById("scroll");
-  const scrollValEl = document.getElementById("scrollVal");
   if (!scrollEl) {
     scrollEl = document.createElement("input");
     scrollEl.type = "range";
@@ -42,10 +52,6 @@
     scrollEl.style.marginTop = "8px";
     canvas.insertAdjacentElement("afterend", scrollEl);
   }
-
-  // Initialize slider value labels (if present)
-  if (zoomValEl && zoomEl) zoomValEl.textContent = `${Number(zoomEl.value) || 1}×`;
-  if (scrollValEl && scrollEl) scrollValEl.textContent = `${Math.round((Number(scrollEl.value) || 0) / 10)}%`;
 
   const ctx2d = canvas.getContext("2d");
   if (!ctx2d) {
@@ -88,10 +94,6 @@
     markerXs: [], // [{x, beatIndex}]
     selectedBeatIndex: -1
   };
-
-  // Initialize slider readouts (if present)
-  if (zoomValEl && zoomEl) zoomValEl.textContent = `${Number(zoomEl.value) || 1}×`;
-  if (scrollValEl && scrollEl) scrollValEl.textContent = `${Math.round((Number(scrollEl.value) || 0) / 10)}%`;
 
   // ---------- HELPERS ----------
   const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
@@ -316,7 +318,8 @@
     const rect = canvas.getBoundingClientRect();
     const dpr = window.devicePixelRatio || 1;
     canvas.width = Math.max(1, Math.floor(rect.width * dpr));
-    canvas.height = Math.max(1, Math.floor((canvas.getAttribute("height") ? Number(canvas.getAttribute("height")) : rect.height) * dpr));
+    const cssH = canvas.getAttribute("height") ? Number(canvas.getAttribute("height")) : rect.height;
+    canvas.height = Math.max(1, Math.floor(cssH * dpr));
     ctx2d.setTransform(dpr, 0, 0, dpr, 0, 0);
   }
 
@@ -353,34 +356,29 @@
     // background clear
     ctx2d.clearRect(0, 0, w, h);
 
-    // waveform
-    // NOTE: When "zoomed out" we must not draw just one sample per pixel.
-    // Doing so causes apparent *vertical* scaling (peaks get missed and the
-    // waveform looks shorter). Instead, draw the min/max envelope per pixel.
+    // waveform (min/max envelope per pixel so peaks are preserved at any zoom)
     ctx2d.beginPath();
     ctx2d.lineWidth = 1;
     ctx2d.strokeStyle = "#38bdf8";
 
-    // downsample by pixel (min/max envelope)
-    const step = Math.max(1, Math.floor(viewLen / w));
+    const step = Math.max(1, viewLen / w);
     for (let x = 0; x < w; x++) {
-      const i0 = start + x * step;
+      const i0 = Math.floor(start + x * step);
+      const i1 = Math.min(end, Math.floor(start + (x + 1) * step));
       if (i0 >= end) break;
-      const i1 = Math.min(end, i0 + step);
 
-      let min = 1;
-      let max = -1;
+      let min = 1, max = -1;
+      // Scan the bucket [i0, i1)
       for (let i = i0; i < i1; i++) {
-        const s = samples[i] || 0;
-        if (s < min) min = s;
-        if (s > max) max = s;
+        const v = samples[i] || 0;
+        if (v < min) min = v;
+        if (v > max) max = v;
       }
 
-      const yMin = mid + min * mid;
-      const yMax = mid + max * mid;
-      // vertical line showing the amplitude range for this pixel column
-      ctx2d.moveTo(x, yMin);
-      ctx2d.lineTo(x, yMax);
+      const y1 = mid + max * mid;
+      const y2 = mid + min * mid;
+      ctx2d.moveTo(x, y1);
+      ctx2d.lineTo(x, y2);
     }
     ctx2d.stroke();
 
@@ -564,24 +562,46 @@
     URL.revokeObjectURL(url);
   }
 
-  // ---------- EVENTS ----------
+    updateControlReadouts();
+
+// ---------- EVENTS ----------
   if (zoomEl) {
     zoomEl.addEventListener("input", () => {
+      const samples = state.samples;
+      if (!samples) return;
+
+      // Preserve the current center position while zooming
+      const { start, end } = getViewRange();
+      const center = (start + end) / 2;
+
       state.zoom = Number(zoomEl.value) || 1;
-      if (zoomValEl) zoomValEl.textContent = `${state.zoom}×`;
+
+      const total = samples.length;
+      const viewLen = Math.max(1, Math.floor(total / clamp(state.zoom || 1, 1, 50)));
+      const maxStart = Math.max(0, total - viewLen);
+      const start2 = clamp(Math.floor(center - viewLen / 2), 0, maxStart);
+
+      state.scroll = maxStart ? (start2 / maxStart) : 0;
+
+      // Keep the scroll slider in sync
+      if (scrollEl) {
+        scrollEl.value = String(Math.round(state.scroll * 1000));
+      }
+
+      updateControlReadouts();
       drawWaveformAndOverlay();
     });
   }
 
-  scrollEl.addEventListener("input", () => {
-    // IMPORTANT: if scrollEl is 0..1000, map to 0..1
+scrollEl.addEventListener("input", () => {
+    // scroll slider pans left/right across the current zoomed view
     const v = Number(scrollEl.value) || 0;
     state.scroll = clamp(v / 1000, 0, 1);
-    if (scrollValEl) scrollValEl.textContent = `${Math.round(state.scroll * 100)}%`;
+    updateControlReadouts();
     drawWaveformAndOverlay();
   });
 
-  window.addEventListener("resize", () => drawWaveformAndOverlay());
+window.addEventListener("resize", () => drawWaveformAndOverlay());
 
   canvas.addEventListener("mousemove", (e) => {
     const hit = hitTestMarker(e.clientX, e.clientY);
@@ -629,8 +649,6 @@
       state.zoom = zoomEl ? Number(zoomEl.value) : 1;
       state.scroll = 0;
       scrollEl.value = "0";
-      if (zoomValEl) zoomValEl.textContent = `${state.zoom}×`;
-      if (scrollValEl) scrollValEl.textContent = "0%";
       state.selectedBeatIndex = -1;
 
       // 1) detect click times
