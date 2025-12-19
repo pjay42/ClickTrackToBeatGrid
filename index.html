@@ -31,7 +31,6 @@
 <body>
 
 <h1>Click Track → grandMA3 Beat Grid</h1>
-<h2>@pjcarruth</h2>
 
 <input type="file" id="fileInput" accept=".wav,.mp3" />
 <button id="processBtn">Analyze</button>
@@ -39,14 +38,18 @@
   <canvas id="waveform" height="200"></canvas>
 </div>
 
-<div style="margin-top:10px;">
-  <label for="zoom" style="display:block; margin-bottom:4px;">Zoom</label>
-  <input type="range" id="zoom" min="1" max="20" step="1" value="1" style="width:100%;" />
-</div>
+<div style="margin-top:10px; display:flex; flex-direction:column; gap:8px;">
+  <label for="zoom" style="display:flex; align-items:center; gap:10px;">
+    <span style="min-width:56px;">Zoom</span>
+    <input type="range" id="zoom" min="1" max="20" step="1" value="1" style="flex:1;" />
+    <span id="zoomVal" style="min-width:44px; text-align:right;">1×</span>
+  </label>
 
-<div style="margin-top:10px;">
-  <label for="scroll" style="display:block; margin-bottom:4px;">Scroll / Pan</label>
-  <input type="range" id="scroll" min="0" max="1000" step="1" value="0" style="width:100%;" />
+  <label for="scroll" style="display:flex; align-items:center; gap:10px;">
+    <span style="min-width:56px;">Scroll</span>
+    <input type="range" id="scroll" min="0" max="1000" step="1" value="0" style="flex:1;" />
+    <span id="scrollVal" style="min-width:44px; text-align:right;">0%</span>
+  </label>
 </div>
 <pre id="output"></pre>
 
