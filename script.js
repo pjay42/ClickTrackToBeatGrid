@@ -291,8 +291,12 @@
       }
       
       // emit only if next beat differs by more than 1 BPM
-      if (i === 0 || (rounded && Math.abs(nextBpm - rounded) > 1)) {
-        tempoOut = rounded;
+      if (i === beats.length - 1) {
+        tempoOut = 0; // last beat always zero
+      } else if (i === 0 || (rounded && Math.abs(nextBpm - rounded) > 1)) {
+        tempoOut = rounded; // first beat always emits; others only if next differs > 1 BPM
+      } else {
+        tempoOut = 0;
       }
 
       return {
