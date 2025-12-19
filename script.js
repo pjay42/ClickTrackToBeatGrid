@@ -9,6 +9,7 @@
   const canvas = document.getElementById("waveform");
   const output = document.getElementById("output");
   const zoomEl = document.getElementById("zoom");
+  const zoomValEl = document.getElementById("zoomVal");
 
   if (!fileInput || !processBtn || !canvas || !output) {
     console.error("Missing required DOM elements: fileInput, processBtn, waveform, output");
@@ -28,6 +29,7 @@
 
   // Create scroll slider if not present (bottom navigation)
   let scrollEl = document.getElementById("scroll");
+  const scrollValEl = document.getElementById("scrollVal");
   if (!scrollEl) {
     scrollEl = document.createElement("input");
     scrollEl.type = "range";
@@ -40,8 +42,10 @@
     scrollEl.style.marginTop = "8px";
     canvas.insertAdjacentElement("afterend", scrollEl);
   }
-  // If the element exists in HTML, keep it visually consistent.
-  scrollEl.style.width = scrollEl.style.width || "100%";
+
+  // Initialize slider value labels (if present)
+  if (zoomValEl && zoomEl) zoomValEl.textContent = `${Number(zoomEl.value) || 1}×`;
+  if (scrollValEl && scrollEl) scrollValEl.textContent = `${Math.round((Number(scrollEl.value) || 0) / 10)}%`;
 
   const ctx2d = canvas.getContext("2d");
   if (!ctx2d) {
@@ -84,6 +88,10 @@
     markerXs: [], // [{x, beatIndex}]
     selectedBeatIndex: -1
   };
+
+  // Initialize slider readouts (if present)
+  if (zoomValEl && zoomEl) zoomValEl.textContent = `${Number(zoomEl.value) || 1}×`;
+  if (scrollValEl && scrollEl) scrollValEl.textContent = `${Math.round((Number(scrollEl.value) || 0) / 10)}%`;
 
   // ---------- HELPERS ----------
   const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
@@ -346,29 +354,33 @@
     ctx2d.clearRect(0, 0, w, h);
 
     // waveform
-    // Use a min/max envelope per pixel to avoid aliasing artifacts that can look like
-    // the waveform is "scaling" vertically when panning.
+    // NOTE: When "zoomed out" we must not draw just one sample per pixel.
+    // Doing so causes apparent *vertical* scaling (peaks get missed and the
+    // waveform looks shorter). Instead, draw the min/max envelope per pixel.
     ctx2d.beginPath();
     ctx2d.lineWidth = 1;
     ctx2d.strokeStyle = "#38bdf8";
 
-    const spp = viewLen / Math.max(1, w); // samples-per-pixel (float)
+    // downsample by pixel (min/max envelope)
+    const step = Math.max(1, Math.floor(viewLen / w));
     for (let x = 0; x < w; x++) {
-      const i0 = start + Math.floor(x * spp);
-      const i1 = Math.min(end, start + Math.floor((x + 1) * spp));
+      const i0 = start + x * step;
       if (i0 >= end) break;
+      const i1 = Math.min(end, i0 + step);
 
-      let min = 1, max = -1;
-      // Ensure at least one sample is considered even at extreme zoom
-      const stop = Math.max(i0 + 1, i1);
-      for (let i = i0; i < stop; i++) {
+      let min = 1;
+      let max = -1;
+      for (let i = i0; i < i1; i++) {
         const s = samples[i] || 0;
         if (s < min) min = s;
         if (s > max) max = s;
       }
 
-      ctx2d.moveTo(x, mid + min * mid);
-      ctx2d.lineTo(x, mid + max * mid);
+      const yMin = mid + min * mid;
+      const yMax = mid + max * mid;
+      // vertical line showing the amplitude range for this pixel column
+      ctx2d.moveTo(x, yMin);
+      ctx2d.lineTo(x, yMax);
     }
     ctx2d.stroke();
 
@@ -556,6 +568,7 @@
   if (zoomEl) {
     zoomEl.addEventListener("input", () => {
       state.zoom = Number(zoomEl.value) || 1;
+      if (zoomValEl) zoomValEl.textContent = `${state.zoom}×`;
       drawWaveformAndOverlay();
     });
   }
@@ -564,6 +577,7 @@
     // IMPORTANT: if scrollEl is 0..1000, map to 0..1
     const v = Number(scrollEl.value) || 0;
     state.scroll = clamp(v / 1000, 0, 1);
+    if (scrollValEl) scrollValEl.textContent = `${Math.round(state.scroll * 100)}%`;
     drawWaveformAndOverlay();
   });
 
@@ -615,6 +629,8 @@
       state.zoom = zoomEl ? Number(zoomEl.value) : 1;
       state.scroll = 0;
       scrollEl.value = "0";
+      if (zoomValEl) zoomValEl.textContent = `${state.zoom}×`;
+      if (scrollValEl) scrollValEl.textContent = "0%";
       state.selectedBeatIndex = -1;
 
       // 1) detect click times
