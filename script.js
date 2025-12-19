@@ -268,7 +268,6 @@
   // Compute BPM per beat, detect tempo-change “outputs” per your rules
   function computeTempoOutputs(beats) {
     // bpm at beat i = 60 / (t[i] - t[i-1]) for i>=1
-    let lastTempoOut = null;
     const out = beats.map((b, i) => {
       let bpm = 0;
       if (i > 0) {
@@ -282,22 +281,18 @@
       // - must be 1 decimal place if we output it (e.g., 120.0)
       // - but output 0 if within 1 BPM of the last OUTPUT tempo
       let tempoOut = 0;
-      if (i === 0) {
-        tempoOut = bpm ? Number(fmt1(bpm)) : 0;
-        lastTempoOut = tempoOut || null;
-      } else {
-        const rounded = bpm ? Number(fmt1(bpm)) : 0;
-        if (lastTempoOut == null) {
-          tempoOut = rounded;
-          if (tempoOut) lastTempoOut = tempoOut;
-        } else {
-          if (rounded && Math.abs(rounded - lastTempoOut) > 1) {
-            tempoOut = rounded;
-            lastTempoOut = tempoOut;
-          } else {
-            tempoOut = 0;
-          }
-        }
+      const rounded = bpm ? Number(fmt1(bpm)) : 0;
+      
+      // compute next beat tempo
+      let nextBpm = 0;
+      if (i + 1 < beats.length) {
+        const dtNext = beats[i + 1].time - b.time;
+        nextBpm = dtNext > 0 ? Number(fmt1(60 / dtNext)) : 0;
+      }
+      
+      // emit only if next beat differs by more than 1 BPM
+      if (rounded && Math.abs(nextBpm - rounded) > 1) {
+        tempoOut = rounded;
       }
 
       return {
