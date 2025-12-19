@@ -9,6 +9,7 @@
   const canvas = document.getElementById("waveform");
   const output = document.getElementById("output");
   const zoomEl = document.getElementById("zoom");
+  const zoomValEl = document.getElementById("zoomVal");
 
   if (!fileInput || !processBtn || !canvas || !output) {
     console.error("Missing required DOM elements: fileInput, processBtn, waveform, output");
@@ -28,6 +29,7 @@
 
   // Create scroll slider if not present (bottom navigation)
   let scrollEl = document.getElementById("scroll");
+  const scrollValEl = document.getElementById("scrollVal");
   if (!scrollEl) {
     scrollEl = document.createElement("input");
     scrollEl.type = "range";
@@ -41,19 +43,9 @@
     canvas.insertAdjacentElement("afterend", scrollEl);
   }
 
-  function updateControlReadouts() {
-    const zv = document.getElementById("zoomVal");
-    if (zv) zv.textContent = `${Number(zoomEl.value) || 1}×`;
-
-    const sv = document.getElementById("scrollVal");
-    if (sv) {
-      const max = Number(scrollEl.max) || 0;
-      const val = Number(scrollEl.value) || 0;
-      const pct = max > 0 ? Math.round((val / max) * 100) : 0;
-      sv.textContent = `${pct}%`;
-    }
-  }
-
+  // Initialize slider value labels (if present)
+  if (zoomValEl && zoomEl) zoomValEl.textContent = `${Number(zoomEl.value) || 1}×`;
+  if (scrollValEl && scrollEl) scrollValEl.textContent = `${Math.round((Number(scrollEl.value) || 0) / 10)}%`;
 
   const ctx2d = canvas.getContext("2d");
   if (!ctx2d) {
@@ -96,6 +88,10 @@
     markerXs: [], // [{x, beatIndex}]
     selectedBeatIndex: -1
   };
+
+  // Initialize slider readouts (if present)
+  if (zoomValEl && zoomEl) zoomValEl.textContent = `${Number(zoomEl.value) || 1}×`;
+  if (scrollValEl && scrollEl) scrollValEl.textContent = `${Math.round((Number(scrollEl.value) || 0) / 10)}%`;
 
   // ---------- HELPERS ----------
   const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
@@ -315,15 +311,18 @@
   }
 
   // ---------- WAVEFORM VIEW (zoom + scroll) ----------
-  function resizeCanvas() {
-    // Use actual pixel size for crisp drawing
-    const rect = canvas.getBoundingClientRect();
-    const dpr = window.devicePixelRatio || 1;
-    canvas.width = Math.max(1, Math.floor(rect.width * dpr));
-    const cssH = canvas.getAttribute("height") ? Number(canvas.getAttribute("height")) : rect.height;
-    canvas.height = Math.max(1, Math.floor(cssH * dpr));
-    ctx2d.setTransform(dpr, 0, 0, dpr, 0, 0);
-  }
+function resizeCanvas() {
+  // Use actual pixel size for crisp drawing (CSS pixels * devicePixelRatio)
+  const rect = canvas.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+
+  canvas.width = Math.max(1, Math.floor(rect.width * dpr));
+  canvas.height = Math.max(1, Math.floor(rect.height * dpr));
+
+  // Draw using CSS pixel coordinates
+  ctx2d.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+
 
   function getViewRange() {
     const samples = state.samples;
@@ -358,31 +357,36 @@
     // background clear
     ctx2d.clearRect(0, 0, w, h);
 
-    // waveform (min/max envelope per pixel so peaks are preserved at any zoom)
-    ctx2d.beginPath();
-    ctx2d.lineWidth = 1;
-    ctx2d.strokeStyle = "#38bdf8";
+// waveform (min/max envelope per pixel, stable across zoom/scroll)
+// Map each pixel column to an exact sample range using proportional mapping.
+// This avoids "apparent vertical scaling" caused by missed peaks or bucket drift.
+ctx2d.beginPath();
+ctx2d.lineWidth = 1;
+ctx2d.strokeStyle = "#38bdf8";
 
-    const step = Math.max(1, viewLen / w);
-    for (let x = 0; x < w; x++) {
-      const i0 = Math.floor(start + x * step);
-      const i1 = Math.min(end, Math.floor(start + (x + 1) * step));
-      if (i0 >= end) break;
+const wInt = Math.max(1, Math.floor(w));
+for (let x = 0; x < wInt; x++) {
+  const a = x / wInt;
+  const b = (x + 1) / wInt;
 
-      let min = 1, max = -1;
-      // Scan the bucket [i0, i1)
-      for (let i = i0; i < i1; i++) {
-        const v = samples[i] || 0;
-        if (v < min) min = v;
-        if (v > max) max = v;
-      }
+  const i0 = start + Math.floor(a * viewLen);
+  const i1 = Math.min(end, start + Math.floor(b * viewLen));
 
-      const y1 = mid + max * mid;
-      const y2 = mid + min * mid;
-      ctx2d.moveTo(x, y1);
-      ctx2d.lineTo(x, y2);
-    }
-    ctx2d.stroke();
+  let min = 1;
+  let max = -1;
+  for (let i = i0; i < i1; i++) {
+    const v = samples[i] || 0;
+    if (v < min) min = v;
+    if (v > max) max = v;
+  }
+
+  const yMin = mid + min * mid;
+  const yMax = mid + max * mid;
+  ctx2d.moveTo(x + 0.5, yMin);
+  ctx2d.lineTo(x + 0.5, yMax);
+}
+ctx2d.stroke();
+
 
     // markers
     state.markerXs = [];
@@ -564,46 +568,53 @@
     URL.revokeObjectURL(url);
   }
 
-    updateControlReadouts();
+  // ---------- EVENTS ----------
+function syncScrollSliderToState() {
+  // Keep scroll slider consistent with state.scroll (0..1)
+  if (!scrollEl) return;
+  const v = Math.round(clamp(state.scroll || 0, 0, 1) * 1000);
+  scrollEl.value = String(v);
+  if (scrollValEl) scrollValEl.textContent = `${Math.round((v / 1000) * 100)}%`;
+}
 
-// ---------- EVENTS ----------
-  if (zoomEl) {
-    zoomEl.addEventListener("input", () => {
-      const samples = state.samples;
-      if (!samples) return;
+if (zoomEl) {
+  zoomEl.addEventListener("input", () => {
+    // Preserve the current view center when changing zoom.
+    const samples = state.samples;
+    if (!samples) return;
 
-      // Preserve the current center position while zooming
-      const { start, end } = getViewRange();
-      const center = (start + end) / 2;
+    const total = samples.length;
+    const prevZoom = clamp(state.zoom || 1, 1, 50);
+    const prevViewLen = Math.max(1, Math.floor(total / prevZoom));
+    const prevScroll = clamp(state.scroll || 0, 0, 1);
+    const prevMaxStart = Math.max(0, total - prevViewLen);
+    const prevStart = Math.floor(prevScroll * prevMaxStart);
+    const center = prevStart + prevViewLen / 2;
 
-      state.zoom = Number(zoomEl.value) || 1;
+    state.zoom = Number(zoomEl.value) || 1;
+    state.zoom = clamp(state.zoom, 1, 50);
+    if (zoomValEl) zoomValEl.textContent = `${state.zoom}×`;
 
-      const total = samples.length;
-      const viewLen = Math.max(1, Math.floor(total / clamp(state.zoom || 1, 1, 50)));
-      const maxStart = Math.max(0, total - viewLen);
-      const start2 = clamp(Math.floor(center - viewLen / 2), 0, maxStart);
+    const newViewLen = Math.max(1, Math.floor(total / state.zoom));
+    const newMaxStart = Math.max(0, total - newViewLen);
+    const newStart = clamp(Math.floor(center - newViewLen / 2), 0, newMaxStart);
 
-      state.scroll = maxStart ? (start2 / maxStart) : 0;
+    state.scroll = newMaxStart ? (newStart / newMaxStart) : 0;
+    syncScrollSliderToState();
+    drawWaveformAndOverlay();
+  });
+}
 
-      // Keep the scroll slider in sync
-      if (scrollEl) {
-        scrollEl.value = String(Math.round(state.scroll * 1000));
-      }
 
-      updateControlReadouts();
-      drawWaveformAndOverlay();
-    });
-  }
-
-scrollEl.addEventListener("input", () => {
-    // scroll slider pans left/right across the current zoomed view
+  scrollEl.addEventListener("input", () => {
+    // IMPORTANT: if scrollEl is 0..1000, map to 0..1
     const v = Number(scrollEl.value) || 0;
     state.scroll = clamp(v / 1000, 0, 1);
-    updateControlReadouts();
+    if (scrollValEl) scrollValEl.textContent = `${Math.round(state.scroll * 100)}%`;
     drawWaveformAndOverlay();
   });
 
-window.addEventListener("resize", () => drawWaveformAndOverlay());
+  window.addEventListener("resize", () => drawWaveformAndOverlay());
 
   canvas.addEventListener("mousemove", (e) => {
     const hit = hitTestMarker(e.clientX, e.clientY);
@@ -651,6 +662,8 @@ window.addEventListener("resize", () => drawWaveformAndOverlay());
       state.zoom = zoomEl ? Number(zoomEl.value) : 1;
       state.scroll = 0;
       scrollEl.value = "0";
+      if (zoomValEl) zoomValEl.textContent = `${state.zoom}×`;
+      if (scrollValEl) scrollValEl.textContent = "0%";
       state.selectedBeatIndex = -1;
 
       // 1) detect click times
