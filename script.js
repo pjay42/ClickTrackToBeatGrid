@@ -461,8 +461,8 @@ ctx2d.stroke();
     // Chronological list, one per line
     // {sec(3dp), downbeat(1/0), tempo(1dp or 0)}
     const lines = [];
-    lines.push("beatTable preview (chronological):");
-    lines.push("{seconds,downbeat,tempoOut}");
+    lines.push("beatTable preview:");
+    lines.push("{seconds, downbeat, tempo change}");
     for (let i = 0; i < beats.length; i++) {
       const b = beats[i];
       const sec = fmt3(b.time);
@@ -473,9 +473,9 @@ ctx2d.stroke();
     output.textContent = lines.join("\n");
   }
 
-  // ---------- MA3 LUA/XML (COPIED STYLE FROM MIDI APP) ----------
+  // ---------- MA3 LUA/XML  ----------
   function formatSecondsFromSeconds(sec) {
-    // mimic MIDI app: fixed(3), trim trailing zeros, and remove leading 0 for decimals
+
     const s = Number(sec).toFixed(3);
     const trimmed = s.replace(/\.?0+$/, "");
     if (trimmed === "") return "0";
