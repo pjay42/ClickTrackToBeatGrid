@@ -1,15 +1,3 @@
-
-
-  function updateControlReadouts() {
-    const zv = document.getElementById("zoomVal");
-    if (zv && zoomEl) zv.textContent = `${Number(zoomEl.value) || 1}×`;
-
-    const sv = document.getElementById("scrollVal");
-    if (sv && scrollEl) {
-      const pct = Math.round((Number(scrollEl.value) || 0) / 10);
-      sv.textContent = `${pct}%`;
-    }
-  }
 // Click Track → grandMA3 Beat Grid (MA3 plugin XML generator)
 // Drop-in script.js
 (() => {
@@ -52,6 +40,20 @@
     scrollEl.style.marginTop = "8px";
     canvas.insertAdjacentElement("afterend", scrollEl);
   }
+
+  function updateControlReadouts() {
+    const zv = document.getElementById("zoomVal");
+    if (zv) zv.textContent = `${Number(zoomEl.value) || 1}×`;
+
+    const sv = document.getElementById("scrollVal");
+    if (sv) {
+      const max = Number(scrollEl.max) || 0;
+      const val = Number(scrollEl.value) || 0;
+      const pct = max > 0 ? Math.round((val / max) * 100) : 0;
+      sv.textContent = `${pct}%`;
+    }
+  }
+
 
   const ctx2d = canvas.getContext("2d");
   if (!ctx2d) {
