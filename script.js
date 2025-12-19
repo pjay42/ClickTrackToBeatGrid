@@ -270,7 +270,10 @@
     // bpm at beat i = 60 / (t[i] - t[i-1]) for i>=1
     const out = beats.map((b, i) => {
       let bpm = 0;
-      if (i > 0) {
+      if (i === 0 && beats.length > 1) {
+        const dt0 = beats[1].time - beats[0].time;
+        bpm = dt0 > 0 ? (60 / dt0) : 0;     // beat 0 bpm = beat 1 actual bpm
+      } else if (i > 0) {
         const dt = b.time - beats[i - 1].time;
         bpm = dt > 0 ? (60 / dt) : 0;
       } else {
@@ -291,10 +294,13 @@
       }
       
       // emit only if next beat differs by more than 1 BPM
+      
       if (i === beats.length - 1) {
-        tempoOut = 0; // last beat always zero
-      } else if (i === 0 || (rounded && Math.abs(nextBpm - rounded) > 1)) {
-        tempoOut = rounded; // first beat always emits; others only if next differs > 1 BPM
+        tempoOut = 0;                    // last beat always zero
+      } else if (i === 0) {
+        tempoOut = rounded;              // first beat always emits (now equals beat 1 bpm)
+      } else if (rounded && Math.abs(nextBpm - rounded) > 1) {
+        tempoOut = rounded;              // middle beats: emit only if next differs > 1 BPM
       } else {
         tempoOut = 0;
       }
