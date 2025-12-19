@@ -1,7 +1,7 @@
 (() => {
   "use strict";
 
-  // ===== DOM =====
+  // ---------- DOM ----------
   const fileInput = document.getElementById("fileInput");
   const processBtn = document.getElementById("processBtn");
   const canvas = document.getElementById("waveform");
@@ -9,153 +9,136 @@
   const output = document.getElementById("output");
 
   if (!fileInput || !processBtn || !canvas || !zoomEl || !output) {
-    console.error("Missing required DOM elements:", {
-      fileInput: !!fileInput,
-      processBtn: !!processBtn,
-      waveform: !!canvas,
-      zoom: !!zoomEl,
-      output: !!output,
-    });
+    const missing = [
+      !fileInput && "fileInput",
+      !processBtn && "processBtn",
+      !canvas && "waveform",
+      !zoomEl && "zoom",
+      !output && "output",
+    ].filter(Boolean);
+    console.error("Missing required DOM elements:", missing.join(", "));
     return;
   }
 
   const ctx = canvas.getContext("2d");
-  if (!ctx) {
-    console.error("Canvas 2D context unavailable.");
-    return;
-  }
+  const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
 
-  // If you don’t have a scroll input, we create one and place it right under the canvas.
+  // Canvas container (for positioning tooltip)
+  const canvasContainer =
+    canvas.parentElement && getComputedStyle(canvas.parentElement).position !== "static"
+      ? canvas.parentElement
+      : document.body;
+
+  // ---------- UI: scroll range (create if missing) ----------
   let scrollEl = document.getElementById("scroll");
   if (!scrollEl) {
     scrollEl = document.createElement("input");
     scrollEl.type = "range";
     scrollEl.id = "scroll";
     scrollEl.min = "0";
-    scrollEl.max = "0";
+    scrollEl.max = "1000";
     scrollEl.step = "1";
     scrollEl.value = "0";
     scrollEl.style.width = "100%";
     scrollEl.style.marginTop = "10px";
-    scrollEl.title = "Scroll";
-    canvas.parentElement?.appendChild(scrollEl);
+    // Insert right after canvas (or after wrapper div if present)
+    const after = canvas.parentElement || canvas;
+    after.insertAdjacentElement("afterend", scrollEl);
   }
 
-  // ===== Audio Context =====
-  const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  // ---------- UI: tooltip ----------
+  const tooltip = document.createElement("div");
+  tooltip.style.position = "absolute";
+  tooltip.style.pointerEvents = "none";
+  tooltip.style.padding = "6px 8px";
+  tooltip.style.borderRadius = "8px";
+  tooltip.style.background = "rgba(2, 6, 23, 0.92)";
+  tooltip.style.border = "1px solid rgba(148, 163, 184, 0.35)";
+  tooltip.style.color = "#e2e8f0";
+  tooltip.style.fontSize = "12px";
+  tooltip.style.whiteSpace = "nowrap";
+  tooltip.style.display = "none";
+  tooltip.style.zIndex = "9999";
+  canvasContainer.appendChild(tooltip);
 
-  // ===== State =====
+  // ---------- State ----------
   let audioBuffer = null;
   let samples = null;
-  let sampleRate = 44100;
+  let sampleRate = 48000;
+  let duration = 0;
 
-  // beats: { time, centroid, isDownbeat, bpm? ... }
-  let beats = [];
-  let selectedBeatIndex = -1;
+  let beats = []; // chronological: { idx, time, centroid, isDownbeat, bpm }
+  let tempoChanges = []; // { time, bpm } (rounded)
+  let beatsPerBar = null;
 
-  // View window state
-  let viewStartSec = 0;         // start time of viewport
-  let viewDurSec = 0;           // duration of viewport
-  let totalDurSec = 0;
+  // View window (seconds)
+  let viewStart = 0;
+  let viewDur = 0; // computed from zoom
+  let selectedBeatIdx = -1;
 
-  // For click picking: store marker x positions for current view
-  let markerXs = []; // array of { idx, x, time }
+  // ---------- Helpers ----------
+  const r3 = (x) => Math.round(x * 1000) / 1000; // time
+  const r1 = (x) => Math.round(x * 10) / 10;     // bpm
+  const r2 = (x) => Math.round(x * 100) / 100;   // centroid display
 
-  // ===== Utilities =====
-  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
-  const fmtTime = (t) => Number(t.toFixed(3));
-  const fmtBpm = (b) => Number(b.toFixed(1));
-
-  function resizeCanvasToDisplaySize() {
-    // Canvas CSS can differ from actual resolution; sync for crisp drawing
-    const dpr = window.devicePixelRatio || 1;
-    const rect = canvas.getBoundingClientRect();
-    const w = Math.max(1, Math.floor(rect.width * dpr));
-    const h = Math.max(1, Math.floor(rect.height * dpr));
-    if (canvas.width !== w || canvas.height !== h) {
-      canvas.width = w;
-      canvas.height = h;
-    }
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
-    ctx.scale(dpr, dpr);
+  function clamp(v, a, b) {
+    return Math.max(a, Math.min(b, v));
   }
 
-  // Avoid spread on huge arrays (prevents "Maximum call stack size exceeded")
-  function arrayMaxAbs(floatArray) {
+  function resizeCanvasToCSS() {
+    const w = Math.max(300, canvas.clientWidth || canvas.parentElement?.clientWidth || 800);
+    const h = Math.max(120, canvas.height || 200);
+    canvas.width = w;
+    canvas.height = h;
+  }
+
+  function showError(err) {
+    console.error(err);
+    output.textContent = String(err?.stack || err);
+  }
+
+  // Avoid Math.max(...hugeArray) (stack blowups)
+  function maxAbs(arr) {
     let m = 0;
-    for (let i = 0; i < floatArray.length; i++) {
-      const a = Math.abs(floatArray[i]);
-      if (a > m) m = a;
+    for (let i = 0; i < arr.length; i++) {
+      const v = Math.abs(arr[i]);
+      if (v > m) m = v;
     }
     return m;
   }
 
-  function kmeans2(values, maxIter = 30) {
-    // Simple 1D kmeans for two clusters
-    if (!values.length) return { c0: [], c1: [], m0: 0, m1: 0 };
-
-    const sorted = [...values].sort((a, b) => a - b);
-    let m0 = sorted[Math.floor(sorted.length * 0.25)];
-    let m1 = sorted[Math.floor(sorted.length * 0.75)];
-    if (m0 === m1) m1 = m0 + 1e-6;
-
-    let assign = new Array(values.length).fill(0);
-
-    for (let it = 0; it < maxIter; it++) {
-      let changed = false;
-
-      // assign
-      for (let i = 0; i < values.length; i++) {
-        const v = values[i];
-        const a0 = Math.abs(v - m0);
-        const a1 = Math.abs(v - m1);
-        const k = a0 <= a1 ? 0 : 1;
-        if (assign[i] !== k) {
-          assign[i] = k;
-          changed = true;
-        }
-      }
-
-      // update means
-      let s0 = 0, n0 = 0, s1 = 0, n1 = 0;
-      for (let i = 0; i < values.length; i++) {
-        if (assign[i] === 0) { s0 += values[i]; n0++; }
-        else { s1 += values[i]; n1++; }
-      }
-      const nm0 = n0 ? s0 / n0 : m0;
-      const nm1 = n1 ? s1 / n1 : m1;
-
-      if (Math.abs(nm0 - m0) < 1e-6 && Math.abs(nm1 - m1) < 1e-6 && !changed) break;
-      m0 = nm0; m1 = nm1;
-    }
-
-    const c0 = [], c1 = [];
-    for (let i = 0; i < values.length; i++) {
-      (assign[i] === 0 ? c0 : c1).push(i);
-    }
-    return { c0, c1, m0, m1 };
+  // Convert stereo->mono by averaging (if needed)
+  function getMonoChannel(buffer) {
+    if (buffer.numberOfChannels === 1) return buffer.getChannelData(0);
+    const a = buffer.getChannelData(0);
+    const b = buffer.getChannelData(1);
+    const out = new Float32Array(buffer.length);
+    for (let i = 0; i < out.length; i++) out[i] = (a[i] + b[i]) * 0.5;
+    return out;
   }
 
-  // ===== Core: Decode =====
-  async function decode(file) {
+  // ---------- Audio load ----------
+  async function decodeFile(file) {
     const data = await file.arrayBuffer();
-    return audioCtx.decodeAudioData(data);
+    return await audioCtx.decodeAudioData(data);
   }
 
-  // ===== Core: Click detection =====
+  // ---------- Click detection ----------
   function detectClicks(samples, sr) {
-    // adaptive threshold from max abs
-    const max = arrayMaxAbs(samples);
-    const threshold = max * 0.35;
-    const minGap = 0.08; // seconds
+    // Adaptive threshold based on peak
+    const peak = maxAbs(samples);
+    const threshold = peak * 0.35; // tweakable
+    const minGapSec = 0.08;        // tweakable (80ms)
 
     const clicks = [];
     let last = -Infinity;
 
     for (let i = 0; i < samples.length; i++) {
       const v = Math.abs(samples[i]);
+      if (v < threshold) continue;
+
       const t = i / sr;
-      if (v > threshold && (t - last) > minGap) {
+      if (t - last > minGapSec) {
         clicks.push(t);
         last = t;
       }
@@ -163,44 +146,39 @@
     return clicks;
   }
 
-  // ===== Core: Spectral centroid =====
-  function spectralCentroidFromDb(freqDb, sr, fftSize) {
-    // freqDb is Float32Array in dB (negative values usually)
-    // Convert to linear magnitude; clamp extreme values to avoid everything going huge.
+  // ---------- FFT / centroid ----------
+  function spectralCentroidDb(freqDataDb, sr, fftSize) {
+    // freqDataDb is in dBFS from AnalyserNode
+    // Convert dB -> linear magnitude and compute centroid
     let weighted = 0;
     let sum = 0;
 
-    for (let i = 0; i < freqDb.length; i++) {
-      const db = freqDb[i];
-      if (!isFinite(db)) continue;
+    for (let i = 0; i < freqDataDb.length; i++) {
+      const db = freqDataDb[i];
+      if (!Number.isFinite(db)) continue;
 
-      // Clamp floor to reduce numerical weirdness
-      const clampedDb = Math.max(db, -120);
-      const mag = Math.pow(10, clampedDb / 20); // dB -> linear amplitude
+      // dB -> linear amplitude. Clamp very low values to avoid underflow dominating.
+      const mag = Math.pow(10, db / 20);
       const freq = (i * sr) / fftSize;
 
       weighted += freq * mag;
       sum += mag;
     }
-
-    return sum ? (weighted / sum) : 0;
+    return sum > 0 ? weighted / sum : 0;
   }
 
-  async function analyzeCentroid(samples, sr, timeSec) {
+  async function analyzeCentroid(samples, sr, time) {
     const fftSize = 2048;
-    const start = Math.floor(timeSec * sr);
+    const start = Math.floor(time * sr);
+
     if (start + fftSize >= samples.length) return 0;
 
-    // Copy window
-    const window = new Float32Array(fftSize);
-    for (let i = 0; i < fftSize; i++) {
-      window[i] = samples[start + i] || 0;
-    }
-
-    // Offline render so we can use AnalyserNode for FFT reliably
     const offline = new OfflineAudioContext(1, fftSize, sr);
     const buf = offline.createBuffer(1, fftSize, sr);
-    buf.copyToChannel(window, 0);
+
+    // Copy slice
+    const slice = samples.subarray(start, start + fftSize);
+    buf.copyToChannel(slice, 0);
 
     const src = offline.createBufferSource();
     src.buffer = buf;
@@ -218,329 +196,406 @@
     const freqDb = new Float32Array(analyser.frequencyBinCount);
     analyser.getFloatFrequencyData(freqDb);
 
-    return spectralCentroidFromDb(freqDb, sr, fftSize);
+    return spectralCentroidDb(freqDb, sr, fftSize);
   }
 
-  // ===== Core: Tempo (basic change list) =====
-  function detectTempoChanges(clickTimes, toleranceBpm = 1) {
+  // ---------- Classification (robust k-means 2 clusters) ----------
+  function kmeans2(values, iters = 12) {
+    if (values.length < 2) {
+      return { c1: values[0] || 0, c2: values[0] || 0, labels: values.map(() => 0) };
+    }
+
+    // init with percentiles
+    const sorted = [...values].sort((a, b) => a - b);
+    let c1 = sorted[Math.floor(sorted.length * 0.25)];
+    let c2 = sorted[Math.floor(sorted.length * 0.75)];
+    if (c1 === c2) c2 = c1 + 1;
+
+    let labels = new Array(values.length).fill(0);
+
+    for (let k = 0; k < iters; k++) {
+      // assign
+      let s1 = 0, n1 = 0, s2 = 0, n2 = 0;
+      for (let i = 0; i < values.length; i++) {
+        const v = values[i];
+        const d1 = Math.abs(v - c1);
+        const d2 = Math.abs(v - c2);
+        const lab = d1 <= d2 ? 0 : 1;
+        labels[i] = lab;
+        if (lab === 0) { s1 += v; n1++; } else { s2 += v; n2++; }
+      }
+      // update (guard empty)
+      if (n1 > 0) c1 = s1 / n1;
+      if (n2 > 0) c2 = s2 / n2;
+    }
+
+    return { c1, c2, labels };
+  }
+
+  function classifyDownbeatsByCentroid(events) {
+    // events: [{time, centroid}]
+    const cents = events.map(e => e.centroid);
+    const { c1, c2, labels } = kmeans2(cents);
+
+    // Count each cluster; smaller count = downbeats (typical)
+    let n0 = 0, n1 = 0;
+    for (const lab of labels) (lab === 0 ? n0++ : n1++);
+
+    const downLabel = (n0 <= n1) ? 0 : 1;
+    const downCentroid = downLabel === 0 ? c1 : c2;
+    const upCentroid = downLabel === 0 ? c2 : c1;
+
+    // Build with isDownbeat
+    const out = events.map((e, i) => ({
+      ...e,
+      isDownbeat: labels[i] === downLabel,
+      downCentroid,
+      upCentroid
+    }));
+
+    return out;
+  }
+
+  // ---------- Beats-per-bar autodetect ----------
+  function autoBeatsPerBar(beatFlags) {
+    // beatFlags: boolean[] isDownbeat per beat in time order
+    // Choose N in [2..12] that best matches downbeats on a regular grid.
+    if (beatFlags.length < 8) return null;
+
+    let bestN = 4;
+    let bestScore = -Infinity;
+
+    for (let N = 2; N <= 12; N++) {
+      // Try all offsets 0..N-1 and score alignment
+      for (let offset = 0; offset < N; offset++) {
+        let good = 0, bad = 0;
+        for (let i = 0; i < beatFlags.length; i++) {
+          const shouldBeDown = ((i - offset) % N === 0);
+          if (shouldBeDown === beatFlags[i]) good++;
+          else bad++;
+        }
+        const score = good - bad * 1.2;
+        if (score > bestScore) {
+          bestScore = score;
+          bestN = N;
+        }
+      }
+    }
+    return bestN;
+  }
+
+  // ---------- Tempo (per click) + change segmentation ----------
+  function computeBpmPerClick(clickTimes) {
+    // bpm for beat i computed from delta(i-1 -> i). For i=0, copy i=1 later.
+    const bpm = new Array(clickTimes.length).fill(0);
+    for (let i = 1; i < clickTimes.length; i++) {
+      const dt = clickTimes[i] - clickTimes[i - 1];
+      bpm[i] = dt > 0 ? (60 / dt) : 0;
+    }
+    if (clickTimes.length > 1) bpm[0] = bpm[1];
+    return bpm;
+  }
+
+  function segmentTempo(clickTimes, bpmPerClick, toleranceBpm = 1.0) {
     const changes = [];
     let last = null;
 
-    for (let i = 1; i < clickTimes.length; i++) {
-      const dt = clickTimes[i] - clickTimes[i - 1];
-      if (dt <= 0) continue;
-
-      const bpm = 60 / dt;
-      if (last === null || Math.abs(bpm - last) > toleranceBpm) {
-        changes.push({ time: clickTimes[i], bpm });
-        last = bpm;
+    for (let i = 0; i < clickTimes.length; i++) {
+      const b = bpmPerClick[i];
+      if (!Number.isFinite(b) || b <= 0) continue;
+      if (last == null || Math.abs(b - last) > toleranceBpm) {
+        changes.push({ time: clickTimes[i], bpm: b });
+        last = b;
       }
     }
     return changes;
   }
 
-  // ===== Classification (centroid-based, kmeans2) =====
-  function classifyDownbeatsByCentroid(events) {
-    // events: [{time, centroid}]
-    const cents = events.map(e => e.centroid);
-    const { c0, c1 } = kmeans2(cents);
+  // ---------- Waveform drawing (windowed) ----------
+  function drawWaveformWindow(samples, sr, startSec, durSec) {
+    resizeCanvasToCSS();
 
-    // Decide which cluster is downbeats:
-    // Default: smaller cluster -> downbeats (typical 1 per bar).
-    // Fallback: if sizes are similar, use higher centroid as downbeats (common in some click tracks).
-    const n0 = c0.length, n1 = c1.length;
-
-    let downCluster = 0;
-    if (Math.abs(n0 - n1) <= Math.max(2, Math.floor(events.length * 0.02))) {
-      // sizes similar -> use centroid mean rule
-      const mean0 = c0.reduce((s, i) => s + cents[i], 0) / (n0 || 1);
-      const mean1 = c1.reduce((s, i) => s + cents[i], 0) / (n1 || 1);
-      downCluster = mean0 >= mean1 ? 0 : 1;
-    } else {
-      downCluster = n0 < n1 ? 0 : 1;
-    }
-
-    const downSet = new Set((downCluster === 0 ? c0 : c1));
-    return events.map((e, idx) => ({
-      ...e,
-      isDownbeat: downSet.has(idx),
-    }));
-  }
-
-  // ===== Viewport / Zoom / Scroll =====
-  function updateViewport() {
-    if (!audioBuffer) return;
-
-    totalDurSec = audioBuffer.duration;
-
-    const zoom = Number(zoomEl.value || 1); // 1..20
-    // At zoom=1 show entire file; at zoom=20 show 1/20 of file
-    viewDurSec = totalDurSec / zoom;
-    viewDurSec = clamp(viewDurSec, 0.25, totalDurSec);
-
-    // scroll range maps to start time (0..totalDur-viewDur)
-    const maxStart = Math.max(0, totalDurSec - viewDurSec);
-
-    // We use scrollEl as integer steps (0..1000) for stable movement
-    const steps = 1000;
-    scrollEl.max = String(steps);
-    const s = Number(scrollEl.value || 0) / steps;
-    viewStartSec = s * maxStart;
-
-    redraw();
-  }
-
-  // Keep scroll stable while zooming:
-  function onZoomChange() {
-    if (!audioBuffer) return;
-
-    // preserve center time while zooming
-    const prevDur = viewDurSec || audioBuffer.duration;
-    const center = viewStartSec + prevDur / 2;
-
-    const zoom = Number(zoomEl.value || 1);
-    const newDur = clamp(audioBuffer.duration / zoom, 0.25, audioBuffer.duration);
-    const maxStart = Math.max(0, audioBuffer.duration - newDur);
-
-    const newStart = clamp(center - newDur / 2, 0, maxStart);
-    viewDurSec = newDur;
-    viewStartSec = newStart;
-
-    // update scroll value to match newStart
-    const steps = Number(scrollEl.max || 1000);
-    const ratio = maxStart > 0 ? (newStart / maxStart) : 0;
-    scrollEl.value = String(Math.round(ratio * steps));
-
-    redraw();
-  }
-
-  function onScrollChange() {
-    if (!audioBuffer) return;
-    // update start from scroll without jumping
-    const steps = Number(scrollEl.max || 1000);
-    const s = steps > 0 ? (Number(scrollEl.value || 0) / steps) : 0;
-
-    const maxStart = Math.max(0, audioBuffer.duration - viewDurSec);
-    viewStartSec = s * maxStart;
-
-    redraw();
-  }
-
-  // ===== Waveform + Overlay drawing =====
-  function redraw() {
-    if (!samples || !audioBuffer) return;
-
-    resizeCanvasToDisplaySize();
-
-    const rect = canvas.getBoundingClientRect();
-    const W = rect.width;
-    const H = rect.height;
-
-    // background
+    const W = canvas.width;
+    const H = canvas.height;
     ctx.clearRect(0, 0, W, H);
-    ctx.fillStyle = "#020617";
-    ctx.fillRect(0, 0, W, H);
 
-    drawWaveformWindow(W, H);
-    drawBeatOverlay(W, H);
-  }
+    // background baseline
+    ctx.globalAlpha = 1;
+    ctx.strokeStyle = "#1e293b";
+    ctx.beginPath();
+    ctx.moveTo(0, H / 2);
+    ctx.lineTo(W, H / 2);
+    ctx.stroke();
 
-  function drawWaveformWindow(W, H) {
-    // Draw only visible window
-    const startSamp = Math.floor(viewStartSec * sampleRate);
-    const endSamp = Math.min(samples.length, Math.floor((viewStartSec + viewDurSec) * sampleRate));
-    const windowLen = Math.max(1, endSamp - startSamp);
-
-    // Downsample to pixel columns
-    const mid = H / 2;
-    const cols = Math.max(1, Math.floor(W));
-    const step = Math.max(1, Math.floor(windowLen / cols));
+    const startIdx = Math.floor(startSec * sr);
+    const endIdx = Math.min(samples.length, Math.floor((startSec + durSec) * sr));
+    const span = Math.max(1, endIdx - startIdx);
+    const samplesPerPixel = span / W;
 
     ctx.strokeStyle = "#38bdf8";
-    ctx.lineWidth = 1;
+    ctx.globalAlpha = 0.95;
     ctx.beginPath();
 
-    for (let x = 0; x < cols; x++) {
-      const i0 = startSamp + x * step;
-      if (i0 >= endSamp) break;
+    for (let x = 0; x < W; x++) {
+      const i0 = startIdx + Math.floor(x * samplesPerPixel);
+      const i1 = startIdx + Math.floor((x + 1) * samplesPerPixel);
 
-      // min/max peak in this column for nicer waveform
+      // min/max within this pixel column
       let min = 1, max = -1;
-      const i1 = Math.min(endSamp, i0 + step);
-      for (let i = i0; i < i1; i++) {
+      for (let i = i0; i < i1 && i < samples.length; i++) {
         const v = samples[i];
         if (v < min) min = v;
         if (v > max) max = v;
       }
 
-      // draw line from max to min (vertical)
-      const y1 = mid + max * mid;
-      const y2 = mid + min * mid;
+      const y1 = (1 - (max + 1) / 2) * H;
+      const y2 = (1 - (min + 1) / 2) * H;
 
-      ctx.moveTo(x + 0.5, y1);
-      ctx.lineTo(x + 0.5, y2);
+      ctx.moveTo(x, y1);
+      ctx.lineTo(x, y2);
     }
-
     ctx.stroke();
-
-    // viewport info
-    ctx.fillStyle = "rgba(226,232,240,0.85)";
-    ctx.font = "12px system-ui, sans-serif";
-    ctx.fillText(
-      `View: ${fmtTime(viewStartSec)}s → ${fmtTime(viewStartSec + viewDurSec)}s  (zoom ${zoomEl.value}x)`,
-      10,
-      18
-    );
+    ctx.globalAlpha = 1;
   }
 
-  function timeToX(t, W) {
-    const p = (t - viewStartSec) / viewDurSec;
-    return p * W;
+  function timeToX(t) {
+    // map time to x within current window
+    return ((t - viewStart) / viewDur) * canvas.width;
   }
 
-  function drawBeatOverlay(W, H) {
-    markerXs = [];
+  function xToTime(x) {
+    return viewStart + (x / canvas.width) * viewDur;
+  }
 
-    // Draw beat markers that fall in view
-    const t0 = viewStartSec;
-    const t1 = viewStartSec + viewDurSec;
+  // ---------- Beat overlay ----------
+  function drawBeatsOverlay() {
+    if (!beats.length) return;
 
+    // Draw downbeats and beats as vertical lines
     for (let i = 0; i < beats.length; i++) {
       const b = beats[i];
-      if (b.time < t0 || b.time > t1) continue;
+      if (b.time < viewStart || b.time > viewStart + viewDur) continue;
 
-      const x = timeToX(b.time, W);
-      markerXs.push({ idx: i, x, time: b.time });
+      const x = timeToX(b.time);
 
-      // marker
+      // color: downbeat vs beat
+      ctx.strokeStyle = b.isDownbeat ? "#fbbf24" : "#a78bfa";
+      ctx.globalAlpha = 0.9;
       ctx.beginPath();
-      ctx.lineWidth = (i === selectedBeatIndex) ? 2 : 1;
-      ctx.strokeStyle = b.isDownbeat ? "#fbbf24" : "#a78bfa"; // downbeat = amber, beat = purple
-      ctx.moveTo(x + 0.5, 0);
-      ctx.lineTo(x + 0.5, H);
+      ctx.moveTo(x, 0);
+      ctx.lineTo(x, canvas.height);
       ctx.stroke();
+
+      // small marker near bottom
+      ctx.fillStyle = b.isDownbeat ? "#fbbf24" : "#a78bfa";
+      ctx.globalAlpha = 0.95;
+      ctx.beginPath();
+      ctx.arc(x, canvas.height - 10, 3.5, 0, Math.PI * 2);
+      ctx.fill();
     }
 
-    // selected label
-    if (selectedBeatIndex >= 0 && selectedBeatIndex < beats.length) {
-      const b = beats[selectedBeatIndex];
-      ctx.fillStyle = "rgba(2,6,23,0.8)";
-      ctx.fillRect(10, H - 38, 340, 28);
-      ctx.fillStyle = "#e2e8f0";
-      ctx.font = "12px system-ui, sans-serif";
-      ctx.fillText(
-        `Selected: t=${fmtTime(b.time)}s  centroid=${b.centroid.toFixed(2)}  downbeat=${b.isDownbeat ? "true" : "false"} (Shift+Click toggles)`,
-        18,
-        H - 20
-      );
-    }
-  }
-
-  // ===== Click picking =====
-  function pickNearestMarker(xCss) {
-    // xCss is in CSS pixels (not DPR scaled)
-    if (!markerXs.length) return -1;
-
-    // Find nearest marker by x
-    let best = -1;
-    let bestDx = Infinity;
-
-    for (const m of markerXs) {
-      const dx = Math.abs(m.x - xCss);
-      if (dx < bestDx) {
-        bestDx = dx;
-        best = m.idx;
+    // Selected beat highlight
+    if (selectedBeatIdx >= 0 && selectedBeatIdx < beats.length) {
+      const b = beats[selectedBeatIdx];
+      if (b.time >= viewStart && b.time <= viewStart + viewDur) {
+        const x = timeToX(b.time);
+        ctx.strokeStyle = "#22c55e";
+        ctx.globalAlpha = 1;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, canvas.height);
+        ctx.stroke();
+        ctx.lineWidth = 1;
       }
     }
 
-    // Only select if close enough (in px)
-    const PICK_RADIUS = 8;
-    if (bestDx <= PICK_RADIUS) return best;
-    return -1;
+    ctx.globalAlpha = 1;
   }
 
-  canvas.addEventListener("click", (ev) => {
-    if (!beats.length) return;
+  function redrawAll() {
+    if (!samples) return;
+    drawWaveformWindow(samples, sampleRate, viewStart, viewDur);
+    drawBeatsOverlay();
+  }
 
-    const rect = canvas.getBoundingClientRect();
-    const x = ev.clientX - rect.left;
+  // ---------- Beat picking ----------
+  function findNearestBeatAtX(x, pxTolerance = 8) {
+    if (!beats.length) return -1;
+    const t = xToTime(x);
 
-    const idx = pickNearestMarker(x);
-    if (idx === -1) return;
-
-    // Shift+Click toggles downbeat flag
-    if (ev.shiftKey) {
-      beats[idx].isDownbeat = !beats[idx].isDownbeat;
+    // Binary search for nearest time (beats are chronological)
+    let lo = 0, hi = beats.length - 1;
+    while (lo < hi) {
+      const mid = Math.floor((lo + hi) / 2);
+      if (beats[mid].time < t) lo = mid + 1;
+      else hi = mid;
     }
 
-    selectedBeatIndex = idx;
-    renderOutput(); // show selection + overall summary
-    redraw();
-  });
+    const candidates = [lo, lo - 1, lo + 1].filter(i => i >= 0 && i < beats.length);
+    let best = -1;
+    let bestDx = Infinity;
 
-  // ===== Output =====
+    for (const i of candidates) {
+      const bx = timeToX(beats[i].time);
+      const dx = Math.abs(bx - x);
+      if (dx < bestDx) { bestDx = dx; best = i; }
+    }
+
+    return bestDx <= pxTolerance ? best : -1;
+  }
+
+  function showTooltipForBeat(idx, clientX, clientY) {
+    if (idx < 0 || idx >= beats.length) {
+      tooltip.style.display = "none";
+      return;
+    }
+    const b = beats[idx];
+    tooltip.innerHTML =
+      `t: <b>${r3(b.time)}</b>s&nbsp;&nbsp;` +
+      `BPM: <b>${r1(b.bpm)}</b>&nbsp;&nbsp;` +
+      `centroid: <b>${r2(b.centroid)}</b>&nbsp;&nbsp;` +
+      `downbeat: <b>${b.isDownbeat ? "true" : "false"}</b>`;
+
+    tooltip.style.display = "block";
+
+    // Position relative to container
+    const rect = canvas.getBoundingClientRect();
+    const containerRect = canvasContainer.getBoundingClientRect();
+    const x = clientX - containerRect.left + 10;
+    const y = clientY - containerRect.top + 10;
+
+    tooltip.style.left = `${x}px`;
+    tooltip.style.top = `${y}px`;
+  }
+
+  // ---------- Output ----------
   function renderOutput() {
-    const tempoChanges = detectTempoChanges(beats.map(b => b.time));
-    const selected =
-      selectedBeatIndex >= 0 && selectedBeatIndex < beats.length
-        ? beats[selectedBeatIndex]
-        : null;
+    const beatsOut = beats.map(b => ({
+      idx: b.idx,
+      time: r3(b.time),
+      bpm: r1(b.bpm),
+      centroid: r2(b.centroid),
+      downbeat: b.isDownbeat
+    }));
 
-    // Keep output readable + rounded
+    const tempoOut = tempoChanges.map(c => ({
+      time: r3(c.time),
+      bpm: r1(c.bpm)
+    }));
+
     const payload = {
-      summary: {
-        totalBeats: beats.length,
-        downbeats: beats.filter(b => b.isDownbeat).length,
-        durationSec: fmtTime(totalDurSec),
-      },
-      selectedBeat: selected
-        ? {
-            index: selectedBeatIndex,
-            time: fmtTime(selected.time),
-            centroid: Number(selected.centroid.toFixed(2)),
-            downbeat: !!selected.isDownbeat,
-          }
-        : null,
-      tempoChanges: tempoChanges.map(t => ({
-        time: fmtTime(t.time),
-        bpm: fmtBpm(t.bpm),
-      })),
-      beats: beats.map(b => ({
-        time: fmtTime(b.time),
-        centroid: Number(b.centroid.toFixed(2)),
-        downbeat: !!b.isDownbeat,
-      })),
+      durationSec: r3(duration),
+      beatsDetected: beats.length,
+      beatsPerBar: beatsPerBar ?? null,
+      tempoChanges: tempoOut,
+      beats: beatsOut
     };
 
     output.textContent = JSON.stringify(payload, null, 2);
   }
 
-  // ===== Analyze pipeline =====
+  // ---------- Controls ----------
+  function updateViewFromControls() {
+    if (!audioBuffer) return;
+
+    const zoomFactor = Number(zoomEl.value || 1);
+    // Window duration: full duration / zoomFactor, but clamp to at least 1s
+    viewDur = clamp(duration / zoomFactor, 1, duration);
+
+    // Scroll range maps to [0 .. duration - viewDur]
+    const maxStart = Math.max(0, duration - viewDur);
+    const raw = Number(scrollEl.value || 0);
+    const denom = Math.max(1, Number(scrollEl.max || 1000));
+    viewStart = (raw / denom) * maxStart;
+
+    redrawAll();
+  }
+
+  zoomEl.addEventListener("input", () => {
+    // Preserve center time when zoom changes
+    if (!audioBuffer) return;
+    const center = viewStart + viewDur * 0.5;
+
+    const zoomFactor = Number(zoomEl.value || 1);
+    const newDur = clamp(duration / zoomFactor, 1, duration);
+    const maxStart = Math.max(0, duration - newDur);
+
+    viewStart = clamp(center - newDur * 0.5, 0, maxStart);
+    viewDur = newDur;
+
+    // Update scroll slider to match new viewStart
+    const denom = Math.max(1, Number(scrollEl.max || 1000));
+    scrollEl.value = String(Math.round((viewStart / maxStart) * denom) || 0);
+
+    redrawAll();
+  });
+
+  scrollEl.addEventListener("input", updateViewFromControls);
+
+  // Canvas hover/click handlers
+  canvas.addEventListener("mousemove", (e) => {
+    if (!beats.length) return;
+    const rect = canvas.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+
+    const idx = findNearestBeatAtX(x, 10);
+    showTooltipForBeat(idx, e.clientX, e.clientY);
+  });
+
+  canvas.addEventListener("mouseleave", () => {
+    tooltip.style.display = "none";
+  });
+
+  canvas.addEventListener("click", (e) => {
+    if (!beats.length) return;
+    const rect = canvas.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+
+    const idx = findNearestBeatAtX(x, 10);
+    if (idx !== -1) {
+      selectedBeatIdx = idx;
+      redrawAll();
+      // Optional: also scroll output to that beat by re-render (keeps it simple)
+      renderOutput();
+    }
+  });
+
+  // ---------- Main analyze ----------
   processBtn.addEventListener("click", async () => {
     try {
-      if (!fileInput.files.length) return;
+      if (!fileInput.files || !fileInput.files.length) return;
+
+      tooltip.style.display = "none";
+      selectedBeatIdx = -1;
 
       // Required for Safari/Chrome autoplay policies
       await audioCtx.resume();
 
-      processBtn.disabled = true;
-      output.textContent = "Analyzing…";
+      const file = fileInput.files[0];
+      audioBuffer = await decodeFile(file);
 
-      audioBuffer = await decode(fileInput.files[0]);
       sampleRate = audioBuffer.sampleRate;
+      duration = audioBuffer.duration;
 
-      // Use mono channel 0
-      samples = audioBuffer.getChannelData(0);
-      totalDurSec = audioBuffer.duration;
+      // Use mono samples for analysis & drawing
+      samples = getMonoChannel(audioBuffer);
 
-      // Initialize viewport + controls
-      zoomEl.value = zoomEl.value || "1";
+      // Initialize view
+      resizeCanvasToCSS();
+      viewStart = 0;
+      viewDur = clamp(duration / Number(zoomEl.value || 1), 1, duration);
+
+      // Configure scroll slider
+      scrollEl.min = "0";
+      scrollEl.max = "1000";
+      scrollEl.step = "1";
       scrollEl.value = "0";
 
-      // Detect clicks
+      // Detect click times
       const clickTimes = detectClicks(samples, sampleRate);
 
-      // Analyze centroids (async per click)
+      // Analyze centroid for each click
       const events = [];
       for (let i = 0; i < clickTimes.length; i++) {
         const t = clickTimes[i];
@@ -548,33 +603,37 @@
         events.push({ time: t, centroid });
       }
 
-      // classify
-      beats = classifyDownbeatsByCentroid(events).map(b => ({
-        ...b,
-        time: b.time,
-        centroid: b.centroid,
-        isDownbeat: b.isDownbeat,
+      // Tempo per click and change segmentation
+      const bpmPerClick = computeBpmPerClick(clickTimes);
+      tempoChanges = segmentTempo(clickTimes, bpmPerClick, 1.0);
+
+      // Classify downbeats by centroid clustering
+      const classified = classifyDownbeatsByCentroid(events);
+
+      // Beats-per-bar autodetect (best-fit grid)
+      const flags = classified.map(e => e.isDownbeat);
+      beatsPerBar = autoBeatsPerBar(flags);
+
+      // Build chronological beats list with bpm
+      beats = classified.map((e, idx) => ({
+        idx,
+        time: e.time,
+        centroid: e.centroid,
+        isDownbeat: e.isDownbeat,
+        bpm: bpmPerClick[idx] || 0
       }));
 
-      selectedBeatIndex = -1;
-
-      // Setup scroll to use 0..1000 and update viewport
-      scrollEl.max = "1000";
-      scrollEl.value = "0";
-      viewStartSec = 0;
-      updateViewport();
+      // Draw
+      redrawAll();
       renderOutput();
-
     } catch (err) {
-      console.error(err);
-      output.textContent = `Error: ${err?.message || String(err)}`;
-    } finally {
-      processBtn.disabled = false;
+      showError(err);
     }
   });
 
-  // ===== Controls =====
-  zoomEl.addEventListener("input", onZoomChange);
-  scrollEl.addEventListener("input", onScrollChange);
-  window.addEventListener("resize", () => redraw());
+  // Redraw on resize
+  window.addEventListener("resize", () => {
+    if (!samples) return;
+    redrawAll();
+  });
 })();
