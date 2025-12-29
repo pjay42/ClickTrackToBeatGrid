@@ -122,27 +122,65 @@
     return m;
   }
 
-  function detectClicks(samples, sr) {
-    // Adaptive threshold (safe for large files)
+    function detectClicks(samples, sr) {
     const m = maxAbs(samples);
     const threshold = m * 0.35; // tweakable
-    const minGap = 0.08;        // 80ms (tweakable)
-
+    const minGap = 0.08;        // 80ms
+  
+    // how far to search after a crossing to find the real transient peak
+    const peakSearchMs = 8; // 6–12ms usually works well for click tracks
+    const peakSearch = Math.max(1, Math.floor((peakSearchMs / 1000) * sr));
+  
     const clicks = [];
     let last = -Infinity;
-
+  
+    // Parabolic interpolation to get sub-sample peak position.
+    // Returns offset in [-0.5, 0.5] samples approximately.
+    function parabolicOffset(yPrev, y0, yNext) {
+      const denom = (yPrev - 2 * y0 + yNext);
+      if (denom === 0) return 0;
+      // vertex of parabola fit through three points at -1,0,+1
+      return 0.5 * (yPrev - yNext) / denom;
+    }
+  
     for (let i = 0; i < samples.length; i++) {
       const v = Math.abs(samples[i]);
       if (v < threshold) continue;
-
-      const t = i / sr;
-      if (t - last > minGap) {
-        clicks.push(t);
-        last = t;
+  
+      // found a crossing — now refine
+      // don't allow multiple triggers within minGap
+      const roughT = i / sr;
+      if (roughT - last <= minGap) continue;
+  
+      // find peak in the next peakSearch samples
+      const end = Math.min(samples.length - 2, i + peakSearch);
+      let p = i;
+      let best = Math.abs(samples[i]);
+      for (let k = i + 1; k <= end; k++) {
+        const a = Math.abs(samples[k]);
+        if (a > best) {
+          best = a;
+          p = k;
+        }
       }
+  
+      // sub-sample peak using parabola around |sample|
+      const yPrev = Math.abs(samples[p - 1]);
+      const y0 = Math.abs(samples[p]);
+      const yNext = Math.abs(samples[p + 1]);
+      const off = parabolicOffset(yPrev, y0, yNext);
+  
+      const refinedT = (p + off) / sr;
+      clicks.push(refinedT);
+      last = refinedT;
+  
+      // skip ahead a little so we don't re-trigger inside the same transient
+      i = p + Math.floor(0.002 * sr); // 2ms
     }
+  
     return clicks;
   }
+
 
   function spectralCentroid(freqDataDb, sampleRate, fftSize) {
     // Compute centroid in a useful band to avoid “everything ~7400Hz”:
