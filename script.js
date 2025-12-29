@@ -267,45 +267,58 @@
 
   // Forward-looking BPM (segment tempo), but beatTable emits changes vs PREVIOUS segment.
   // Beat 0 always emits.
+  // Uses high-res tempo internally; rounds to 1 decimal only for output/display.
   function computeTempoOutputs(beats) {
-    const segTempo = (i) => {
+    const segTempoRaw = (i) => {
       if (i < 0 || i >= beats.length - 1) return 0; // last beat has no next interval
       const dt = beats[i + 1].time - beats[i].time;
-      return dt > 0 ? Number(fmt1(60 / dt)) : 0;
+      return dt > 0 ? (60 / dt) : 0; // <-- NO rounding here
+    };
+  
+    const segTempoOut = (i) => {
+      const raw = segTempoRaw(i);
+      return raw ? Number(fmt1(raw)) : 0; // <-- round only for output
     };
   
     return beats.map((b, i) => {
       const isLast = (i === beats.length - 1);
   
-      // "Actual tempo at this click" = tempo of the segment starting at this click
-      const thisSeg = isLast ? 0 : segTempo(i);
+      // high-res segment tempo starting at this beat
+      const thisRaw = isLast ? 0 : segTempoRaw(i);
+      const thisOut = isLast ? 0 : segTempoOut(i);
   
-      // bpm field (for tooltip) should also reflect the segment tempo.
-      let bpm = thisSeg;
+      // bpm field for tooltip: keep same 1-decimal output, but compute avg using raw
+      let bpmOut = thisOut;
       if (!isLast && i === 0 && beats.length > 1) {
         const lastIdx = Math.min(3, beats.length - 1); // 4 clicks
         const intervals = lastIdx;
         const totalDt = beats[lastIdx].time - beats[0].time;
         const avgDt = intervals > 0 ? (totalDt / intervals) : 0;
-        bpm = avgDt > 0 ? Number(fmt1(60 / avgDt)) : thisSeg;
+        const avgRaw = avgDt > 0 ? (60 / avgDt) : 0;
+        bpmOut = avgRaw ? Number(fmt1(avgRaw)) : thisOut;
       }
   
       // beatTable tempo change emission:
+      // Keep your existing rule: emit 0 if change within 1 BPM.
+      // BUT evaluate change using high-res raw tempo (not rounded-to-0.1 first).
       let beatTableTempo = 0;
   
       if (isLast) {
         beatTableTempo = 0;
       } else if (i === 0) {
-        beatTableTempo = thisSeg; // beat 0 always announces
+        beatTableTempo = thisOut; // beat 0 always announces (1 decimal)
       } else {
-        const prevSeg = segTempo(i - 1);
-        beatTableTempo = (prevSeg && Math.abs(thisSeg - prevSeg) <= 1) ? 0 : thisSeg;
+        const prevRaw = segTempoRaw(i - 1);
+        const sameEnough = (prevRaw && Math.abs(thisRaw - prevRaw) <= 1); // <-- high-res compare
+        beatTableTempo = sameEnough ? 0 : thisOut; // <-- output stays 1 decimal
       }
   
-      // Keep tempoOut for UI/debug if you want it:
-      const tempoOut = beatTableTempo;
-  
-      return { ...b, bpm, tempoOut, beatTableTempo };
+      return {
+        ...b,
+        bpm: bpmOut,                 // 1 decimal, same as before
+        tempoOut: beatTableTempo,    // 1 decimal or 0, same as before
+        beatTableTempo               // 1 decimal or 0, same as before
+      };
     });
   }
 
