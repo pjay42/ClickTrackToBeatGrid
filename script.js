@@ -267,53 +267,63 @@
 
   // Compute BPM per beat
   function computeTempoOutputs(beats) {
-    // bpm at beat i = 60 / (t[i] - t[i-1]) for i>=1
+    // Helper: average tempo over first up-to-8 beats (beat 0..k), using (k) intervals.
+    function firstBeatAverageBpm(beats) {
+      if (!beats || beats.length < 2) return 0;
+  
+      const lastIdx = Math.min(7, beats.length - 1); // up to beat 7 (8 clicks)
+      const intervals = lastIdx;                     // number of gaps from beat 0 to beat lastIdx
+      if (intervals <= 0) return 0;
+  
+      const totalDt = beats[lastIdx].time - beats[0].time; // spans 'intervals' gaps
+      const avgDt = totalDt / intervals;
+  
+      return avgDt > 0 ? (60 / avgDt) : 0;
+    }
+  
     const out = beats.map((b, i) => {
       let bpm = 0;
-      if (i === 0 && beats.length > 1) {
-        const dt0 = beats[1].time - beats[0].time;
-        bpm = dt0 > 0 ? (60 / dt0) : 0;     // beat 0 bpm = beat 1 actual bpm
-      } else if (i > 0) {
+  
+      if (i === 0) {
+        // NEW: beat 0 BPM is the average of the first 8 clicks (or fewer if not available)
+        bpm = firstBeatAverageBpm(beats);
+      } else {
+        // unchanged for other beats
         const dt = b.time - beats[i - 1].time;
         bpm = dt > 0 ? (60 / dt) : 0;
-      } else {
-        bpm = 0;
       }
-
-      // tempoOut rule:
-      // - must be 1 decimal place if we output it (e.g., 120.0)
-      // - but output 0 if within 1 BPM of the last OUTPUT tempo
+  
+      // tempoOut rule (unchanged logic, but now uses the corrected bpm for i===0)
       let tempoOut = 0;
       const rounded = bpm ? Number(fmt1(bpm)) : 0;
-      
-      // compute next beat tempo
+  
+      // compute next beat tempo (still based on the next interval)
       let nextBpm = 0;
       if (i + 1 < beats.length) {
         const dtNext = beats[i + 1].time - b.time;
         nextBpm = dtNext > 0 ? Number(fmt1(60 / dtNext)) : 0;
       }
-      
-      // emit only if next beat differs by more than 1 BPM
-      
+  
       if (i === beats.length - 1) {
-        tempoOut = 0;                    // last beat always zero
+        tempoOut = 0;                 // last beat always zero
       } else if (i === 0) {
-        tempoOut = rounded;              // first beat always emits (now equals beat 1 bpm)
+        tempoOut = rounded;           // first beat always emits
       } else if (rounded && Math.abs(nextBpm - rounded) > 1) {
-        tempoOut = rounded;              // middle beats: emit only if next differs > 1 BPM
+        tempoOut = rounded;           // middle beats: emit only if next differs > 1 BPM
       } else {
         tempoOut = 0;
       }
-
+  
       return {
         ...b,
         bpm,
         tempoOut
       };
     });
-
+  
     return out;
   }
+
 
   // ---------- WAVEFORM VIEW (zoom + scroll) ----------
 function resizeCanvas() {
