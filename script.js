@@ -328,6 +328,25 @@
     });
   }
 
+  function applyBeatTableTempoSuppression(beats) {
+  // Produces beats with beatTableTempo:
+  // Same as tempoOut, except suppressed if previous tempoOut is within 1 BPM.
+  return beats.map((b, i) => {
+    let beatTableTempo = b.tempoOut || 0;
+
+    if (i > 0 && beatTableTempo) {
+      const prev = beats[i - 1].tempoOut || 0;
+
+      // Only suppress if previous beat actually emitted a tempo
+      if (prev && Math.abs(beatTableTempo - prev) <= 1) {
+        beatTableTempo = 0;
+      }
+    }
+
+    return { ...b, beatTableTempo };
+  });
+}
+
 
   // ---------- WAVEFORM VIEW (zoom + scroll) ----------
 function resizeCanvas() {
@@ -489,7 +508,7 @@ ctx2d.stroke();
       const b = beats[i];
       const sec = fmt3(b.time);
       const down = b.downbeat ? 1 : 0;
-      const tempoOut = b.tempoOut ? fmt1(b.tempoOut) : "0";
+      const tempoOut = b.beatTableTempo ? fmt1(b.beatTableTempo) : "0";
       lines.push(`{${sec},${down},${tempoOut}}`);
     }
     output.textContent = lines.join("\n");
@@ -518,7 +537,7 @@ ctx2d.stroke();
       const secStr = formatSecondsFromSeconds(b.time);
 
       // tempoOut: either 0 OR 1-decimal number
-      const tempoVal = b.tempoOut ? Number(fmt1(b.tempoOut)) : 0;
+      const tempoVal = b.beatTableTempo ? Number(fmt1(b.beatTableTempo)) : 0;
 
       entries.push(`    {${secStr},${b.downbeat ? 1 : 0},${tempoVal}}${i < beats.length - 1 ? "," : ""}`);
     }
@@ -723,7 +742,7 @@ if (zoomEl) {
 
       // 5) tempo outputs per your rule
       beats = computeTempoOutputs(beats);
-
+      beats = applyBeatTableTempoSuppression(beats);
       // store
       state.beats = beats;
 
