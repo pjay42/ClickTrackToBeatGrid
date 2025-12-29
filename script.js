@@ -265,14 +265,14 @@
     return { beatsPerBar: best.bpb, beats: out };
   }
 
-  // Compute BPM per beat
+  // Compute BPM per beat using the NEXT interval (forward-looking)
   function computeTempoOutputs(beats) {
-    // Helper: average tempo over first up-to-8 beats (beat 0..k), using (k) intervals.
-    function firstBeatAverageBpm(beats) {
+    // Average BPM for beat 0 over first N clicks (N=4), using forward intervals.
+    function firstBeatAverageBpm(beats, clicksToAverage = 4) {
       if (!beats || beats.length < 2) return 0;
   
-      const lastIdx = Math.min(3, beats.length - 1); // up to beat 3 (4 clicks)
-      const intervals = lastIdx;                     // number of gaps from beat 0 to beat lastIdx
+      const lastIdx = Math.min(clicksToAverage - 1, beats.length - 1); // e.g. 3 for 4 clicks
+      const intervals = lastIdx; // number of gaps from beat 0 to beat lastIdx
       if (intervals <= 0) return 0;
   
       const totalDt = beats[lastIdx].time - beats[0].time; // spans 'intervals' gaps
@@ -281,47 +281,51 @@
       return avgDt > 0 ? (60 / avgDt) : 0;
     }
   
-    const out = beats.map((b, i) => {
+    return beats.map((b, i) => {
+      const isLast = (i === beats.length - 1);
+  
+      // bpm is based on the delta to the NEXT click (segment starting at this beat)
       let bpm = 0;
   
-      if (i === 0) {
-        // NEW: beat 0 BPM is the average of the first 8 clicks (or fewer if not available)
-        bpm = firstBeatAverageBpm(beats);
+      if (isLast) {
+        bpm = 0;
+      } else if (i === 0) {
+        // beat 0 uses a forward average over the first 4 clicks
+        bpm = firstBeatAverageBpm(beats, 4);
       } else {
-        // unchanged for other beats
-        const dt = b.time - beats[i - 1].time;
+        const dt = beats[i + 1].time - b.time;
         bpm = dt > 0 ? (60 / dt) : 0;
       }
   
-      // tempoOut rule (unchanged logic, but now uses the corrected bpm for i===0)
+      // tempoOut rule:
+      // - last beat always 0
+      // - first beat always emits
+      // - middle beats emit only if the NEXT segment differs by > 1 BPM
       let tempoOut = 0;
       const rounded = bpm ? Number(fmt1(bpm)) : 0;
   
-      // compute next beat tempo (still based on the next interval)
       let nextBpm = 0;
-      if (i + 1 < beats.length) {
-        const dtNext = beats[i + 1].time - b.time;
+      if (i + 1 < beats.length - 1) {
+        // next segment bpm: from beat i+1 to i+2
+        const dtNext = beats[i + 2].time - beats[i + 1].time;
         nextBpm = dtNext > 0 ? Number(fmt1(60 / dtNext)) : 0;
+      } else {
+        // if there is no "next segment" (i is second-to-last), treat as 0
+        nextBpm = 0;
       }
   
-      if (i === beats.length - 1) {
-        tempoOut = 0;                 // last beat always zero
+      if (isLast) {
+        tempoOut = 0;
       } else if (i === 0) {
-        tempoOut = rounded;           // first beat always emits
+        tempoOut = rounded;
       } else if (rounded && Math.abs(nextBpm - rounded) > 1) {
-        tempoOut = rounded;           // middle beats: emit only if next differs > 1 BPM
+        tempoOut = rounded;
       } else {
         tempoOut = 0;
       }
   
-      return {
-        ...b,
-        bpm,
-        tempoOut
-      };
+      return { ...b, bpm, tempoOut };
     });
-  
-    return out;
   }
 
 
