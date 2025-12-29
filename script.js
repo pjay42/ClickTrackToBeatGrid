@@ -271,7 +271,7 @@
     function firstBeatAverageBpm(beats) {
       if (!beats || beats.length < 2) return 0;
   
-      const lastIdx = Math.min(7, beats.length - 1); // up to beat 7 (8 clicks)
+      const lastIdx = Math.min(3, beats.length - 1); // up to beat 3 (4 clicks)
       const intervals = lastIdx;                     // number of gaps from beat 0 to beat lastIdx
       if (intervals <= 0) return 0;
   
