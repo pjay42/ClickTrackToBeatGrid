@@ -265,79 +265,49 @@
     return { beatsPerBar: best.bpb, beats: out };
   }
 
-  // Compute BPM per beat using the NEXT interval (forward-looking),
-  // and compute tempoOut from the forward-looking segment BPMs.
+  // Forward-looking BPM (segment tempo), but beatTable emits changes vs PREVIOUS segment.
+  // Beat 0 always emits.
   function computeTempoOutputs(beats) {
-    function segmentBpmAt(i) {
-      if (i < 0 || i >= beats.length - 1) return 0; // last has no next
+    const segTempo = (i) => {
+      if (i < 0 || i >= beats.length - 1) return 0; // last beat has no next interval
       const dt = beats[i + 1].time - beats[i].time;
-      return dt > 0 ? (60 / dt) : 0;
-    }
-  
-    // If you still want beat 0's DISPLAY bpm to be a 4-click average:
-    function firstBeatAverageBpm(clicksToAverage = 4) {
-      if (beats.length < 2) return 0;
-      const lastIdx = Math.min(clicksToAverage - 1, beats.length - 1); // 3 for 4 clicks
-      const intervals = lastIdx;
-      if (intervals <= 0) return 0;
-      const totalDt = beats[lastIdx].time - beats[0].time;
-      const avgDt = totalDt / intervals;
-      return avgDt > 0 ? (60 / avgDt) : 0;
-    }
+      return dt > 0 ? Number(fmt1(60 / dt)) : 0;
+    };
   
     return beats.map((b, i) => {
       const isLast = (i === beats.length - 1);
   
-      // bpm for tooltip/UI:
-      // - beat 0 uses average
-      // - others use segment bpm
-      let bpm = 0;
-      if (isLast) bpm = 0;
-      else if (i === 0) bpm = firstBeatAverageBpm(4);
-      else bpm = segmentBpmAt(i);
+      // "Actual tempo at this click" = tempo of the segment starting at this click
+      const thisSeg = isLast ? 0 : segTempo(i);
   
-      // tempoOut for beatTable logic should be based on segment bpm (not averaged bpm)
-      const segBpm = isLast ? 0 : segmentBpmAt(i);
-      const segRounded = segBpm ? Number(fmt1(segBpm)) : 0;
-  
-      const nextSegBpm = (i + 1 <= beats.length - 2) ? segmentBpmAt(i + 1) : 0;
-      const nextSegRounded = nextSegBpm ? Number(fmt1(nextSegBpm)) : 0;
-  
-      let tempoOut = 0;
-      if (isLast) {
-        tempoOut = 0;
-      } else if (i === 0) {
-        // first beat always emits, but emit the segment bpm (not the averaged bpm)
-        tempoOut = segRounded;
-      } else if (segRounded && Math.abs(nextSegRounded - segRounded) > 1) {
-        tempoOut = segRounded;
-      } else {
-        tempoOut = 0;
+      // bpm field (for tooltip) should also reflect the segment tempo.
+      let bpm = thisSeg;
+      if (!isLast && i === 0 && beats.length > 1) {
+        const lastIdx = Math.min(3, beats.length - 1); // 4 clicks
+        const intervals = lastIdx;
+        const totalDt = beats[lastIdx].time - beats[0].time;
+        const avgDt = intervals > 0 ? (totalDt / intervals) : 0;
+        bpm = avgDt > 0 ? Number(fmt1(60 / avgDt)) : thisSeg;
       }
   
-      return { ...b, bpm, tempoOut };
+      // beatTable tempo change emission:
+      let beatTableTempo = 0;
+  
+      if (isLast) {
+        beatTableTempo = 0;
+      } else if (i === 0) {
+        beatTableTempo = thisSeg; // beat 0 always announces
+      } else {
+        const prevSeg = segTempo(i - 1);
+        beatTableTempo = (prevSeg && Math.abs(thisSeg - prevSeg) <= 1) ? 0 : thisSeg;
+      }
+  
+      // Keep tempoOut for UI/debug if you want it:
+      const tempoOut = beatTableTempo;
+  
+      return { ...b, bpm, tempoOut, beatTableTempo };
     });
   }
-
-
-  function applyBeatTableTempoSuppression(beats) {
-  // Produces beats with beatTableTempo:
-  // Same as tempoOut, except suppressed if previous tempoOut is within 1 BPM.
-  return beats.map((b, i) => {
-    let beatTableTempo = b.tempoOut || 0;
-
-    if (i > 0 && beatTableTempo) {
-      const prev = beats[i - 1].tempoOut || 0;
-
-      // Only suppress if previous beat actually emitted a tempo
-      if (prev && Math.abs(beatTableTempo - prev) <= 1) {
-        beatTableTempo = 0;
-      }
-    }
-
-    return { ...b, beatTableTempo };
-  });
-}
 
 
   // ---------- WAVEFORM VIEW (zoom + scroll) ----------
@@ -734,7 +704,6 @@ if (zoomEl) {
 
       // 5) tempo outputs per your rule
       beats = computeTempoOutputs(beats);
-      beats = applyBeatTableTempoSuppression(beats);
       // store
       state.beats = beats;
 
